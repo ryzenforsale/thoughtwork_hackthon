@@ -31,16 +31,23 @@ class _TrackingScreenAState extends State<TrackingScreenA>
   StreamSubscription<Position>? _locationSubscription;
   StreamSubscription<CompassEvent>? _compassSubscription;
   StreamSubscription<LocationData?>? _friendLocationSubscription;
+  StreamSubscription<LocationData?>? _friendCommunityLocationSubscription;
   StreamSubscription<LocationData?>? _friendSessionLocationSubscription;
+  StreamSubscription<Position>? _distanceLocationSubscription;
+  Timer? _locationPollTimer;
 
   double? myLat;
   double? myLng;
+  double? _distanceMyLat;
+  double? _distanceMyLng;
   double myHeading = 0;
 
   double? friendLat;
   double? friendLng;
   double? bleDistance;
+  DateTime? _bleDistanceUpdatedAt;
   StreamSubscription? _bleSubscription;
+  Timer? _distanceRefreshTimer;
 
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
@@ -60,6 +67,9 @@ class _TrackingScreenAState extends State<TrackingScreenA>
   void initState() {
     super.initState();
     _setupAnimations();
+    _distanceRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
     _startTracking();
   }
 
@@ -77,23 +87,25 @@ class _TrackingScreenAState extends State<TrackingScreenA>
       vsync: this,
       duration: const Duration(milliseconds: 500),
     );
-    _arrowAnimation = Tween<double>(begin: 0, end: 0).animate(
-      CurvedAnimation(parent: _arrowController, curve: Curves.easeOut),
-    );
+    _arrowAnimation = Tween<double>(
+      begin: 0,
+      end: 0,
+    ).animate(CurvedAnimation(parent: _arrowController, curve: Curves.easeOut));
   }
 
   void _onCompassEvent(CompassEvent event) {
     if (event.heading == null) return;
-    
+
     double newHeading = event.heading!;
-    
+
     double diff = newHeading - _smoothedHeading;
     if (diff > 180) diff -= 360;
     if (diff < -180) diff += 360;
-    
-    _smoothedHeading = (_smoothedHeading + _headingSmoothingFactor * diff) % 360;
+
+    _smoothedHeading =
+        (_smoothedHeading + _headingSmoothingFactor * diff) % 360;
     if (_smoothedHeading < 0) _smoothedHeading += 360;
-    
+
     setState(() {
       myHeading = _smoothedHeading;
     });
@@ -105,8 +117,11 @@ class _TrackingScreenAState extends State<TrackingScreenA>
       if (now.difference(_lastFirebaseUpdate) > _minUpdateInterval) {
         _lastFirebaseUpdate = now;
         FirebaseService.updateLocation(
-          widget.sessionId, widget.myDeviceId,
-          myLat!, myLng!, myHeading,
+          widget.sessionId,
+          widget.myDeviceId,
+          myLat!,
+          myLng!,
+          myHeading,
         );
       }
     }
@@ -115,26 +130,23 @@ class _TrackingScreenAState extends State<TrackingScreenA>
   void _updateArrowRotation() {
     final bearing = _calculateBearing();
     if (bearing == null) return;
-    
+
     double newRotation = (bearing - myHeading) % 360;
     if (newRotation > 180) newRotation -= 360;
     if (newRotation < -180) newRotation += 360;
 
     _previousArrowRotation = _currentArrowRotation;
     _currentArrowRotation = newRotation;
-    
+
     double diff = _currentArrowRotation - _previousArrowRotation;
     if (diff > 180) diff -= 360;
     if (diff < -180) diff += 360;
-    
+
     _arrowAnimation = Tween<double>(
       begin: _previousArrowRotation,
       end: _previousArrowRotation + diff,
-    ).animate(CurvedAnimation(
-      parent: _arrowController,
-      curve: Curves.easeOut,
-    ));
-    
+    ).animate(CurvedAnimation(parent: _arrowController, curve: Curves.easeOut));
+
     _arrowController.forward(from: 0);
   }
 
@@ -175,6 +187,53 @@ class _TrackingScreenAState extends State<TrackingScreenA>
       },
     );
 
+    // Keep distance responsive without changing the filtered arrow position.
+    _distanceLocationSubscription = LocationService.getRawPositionStream()
+        .listen(
+          (position) {
+            if (!mounted) return;
+            setState(() {
+              _distanceMyLat = position.latitude;
+              _distanceMyLng = position.longitude;
+            });
+          },
+          onError: (e) {
+            print("🔴 [TRACKING_A] Raw Location Error: $e");
+          },
+        );
+
+    // ✅ SAFETY NET: poll getCurrentPosition every 3 seconds so distance
+    // always updates even if both streams stall or die.
+    _locationPollTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      if (!mounted) return;
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: const Duration(seconds: 5),
+        );
+        if (!mounted) return;
+        setState(() {
+          _distanceMyLat = pos.latitude;
+          _distanceMyLng = pos.longitude;
+          // Also update main coords so Firebase stays fresh
+          myLat = pos.latitude;
+          myLng = pos.longitude;
+        });
+        // Push to Firebase
+        final now = DateTime.now();
+        if (now.difference(_lastFirebaseUpdate) > _minUpdateInterval) {
+          _lastFirebaseUpdate = now;
+          FirebaseService.updateLocation(
+            widget.sessionId,
+            widget.myDeviceId,
+            pos.latitude,
+            pos.longitude,
+            myHeading,
+          );
+        }
+      } catch (_) {}
+    });
+
     // 3. Start compass updates
     try {
       _compassSubscription = FlutterCompass.events?.listen((event) {
@@ -186,57 +245,98 @@ class _TrackingScreenAState extends State<TrackingScreenA>
     }
 
     // 4a. Listen to friend's DEVICE location (community mode — friend broadcasts to devices/)
-    _friendLocationSubscription = FirebaseService.listenToDeviceLocation(
-      widget.friendId,
-    ).listen((locationData) {
-      if (!mounted) return;
-      if (locationData != null) {
-        setState(() {
-          friendLat = locationData.lat;
-          friendLng = locationData.lng;
-        });
-        _updateArrowRotation();
-      }
-    }, onError: (e) {
-      print("🔴 [TRACKING_A] Firebase Device Location Error: $e");
-    });
+    _friendLocationSubscription =
+        FirebaseService.listenToDeviceLocation(widget.friendId).listen(
+          (locationData) {
+            if (!mounted) return;
+            if (locationData != null) {
+              setState(() {
+                friendLat = locationData.lat;
+                friendLng = locationData.lng;
+              });
+              _updateArrowRotation();
+            }
+          },
+          onError: (e) {
+            print("🔴 [TRACKING_A] Firebase Device Location Error: $e");
+          },
+        );
+
+    // Community participants publish their position under community_members/.
+    _friendCommunityLocationSubscription =
+        FirebaseService.listenToCommunityMemberLocation(widget.friendId).listen(
+          (locationData) {
+            if (!mounted) return;
+            if (locationData != null) {
+              setState(() {
+                friendLat = locationData.lat;
+                friendLng = locationData.lng;
+              });
+              _updateArrowRotation();
+            }
+          },
+          onError: (e) {
+            print("🔴 [TRACKING_A] Firebase Community Location Error: $e");
+          },
+        );
 
     // 4b. Also listen to friend's SESSION location (individual mode — friend writes to tracking_sessions/)
-    _friendSessionLocationSubscription = FirebaseService.listenToLocation(
-      widget.sessionId,
-      widget.friendId,
-    ).listen((locationData) {
-      if (!mounted) return;
-      if (locationData != null) {
-        setState(() {
-          friendLat = locationData.lat;
-          friendLng = locationData.lng;
-        });
-        _updateArrowRotation();
-      }
-    }, onError: (e) {
-      print("🔴 [TRACKING_A] Firebase Session Location Error: $e");
-    });
+    _friendSessionLocationSubscription =
+        FirebaseService.listenToLocation(
+          widget.sessionId,
+          widget.friendId,
+        ).listen(
+          (locationData) {
+            if (!mounted) return;
+            if (locationData != null) {
+              setState(() {
+                friendLat = locationData.lat;
+                friendLng = locationData.lng;
+              });
+              _updateArrowRotation();
+            }
+          },
+          onError: (e) {
+            print("🔴 [TRACKING_A] Firebase Session Location Error: $e");
+          },
+        );
 
     // 5. Start BLE scanning for distance blending
-    _bleSubscription = BluetoothDistanceService.scanForDevice(widget.friendId).listen((result) {
-      if (mounted && result['distance'] != null && result['distance'] > 0) {
-        setState(() {
-          bleDistance = result['distance'];
+    _bleSubscription = BluetoothDistanceService.scanForDevice(widget.friendId)
+        .listen((result) {
+          if (mounted && result['distance'] != null && result['distance'] > 0) {
+            setState(() {
+              bleDistance = result['distance'];
+              _bleDistanceUpdatedAt = DateTime.now();
+            });
+          }
         });
-      }
-    });
   }
 
   double? _calculateDistance() {
     double? gpsDistance;
-    if (myLat != null && myLng != null && friendLat != null && friendLng != null) {
+    if (_distanceMyLat != null &&
+        _distanceMyLng != null &&
+        friendLat != null &&
+        friendLng != null) {
       gpsDistance = LocationService.calculateDistance(
-        myLat!, myLng!, friendLat!, friendLng!,
+        _distanceMyLat!,
+        _distanceMyLng!,
+        friendLat!,
+        friendLng!,
       );
     }
 
-    if (bleDistance != null && bleDistance! > 0 && gpsDistance != null && gpsDistance > 0) {
+    final bleIsFresh =
+        _bleDistanceUpdatedAt != null &&
+        DateTime.now().difference(_bleDistanceUpdatedAt!) <
+            const Duration(seconds: 3);
+
+    if (bleIsFresh &&
+        bleDistance != null &&
+        bleDistance! > 0 &&
+        gpsDistance != null &&
+        gpsDistance > 0) {
       if (gpsDistance < 10) {
         return bleDistance; // Trust BLE fully at close range
       } else if (gpsDistance < 50) {
@@ -248,11 +348,15 @@ class _TrackingScreenAState extends State<TrackingScreenA>
       }
     }
 
-    return gpsDistance ?? bleDistance;
+    return gpsDistance ?? (bleIsFresh ? bleDistance : null);
   }
 
   double? _calculateBearing() {
-    if (myLat == null || myLng == null || friendLat == null || friendLng == null) return null;
+    if (myLat == null ||
+        myLng == null ||
+        friendLat == null ||
+        friendLng == null)
+      return null;
     return LocationService.calculateBearing(
       myLat!,
       myLng!,
@@ -268,7 +372,7 @@ class _TrackingScreenAState extends State<TrackingScreenA>
   String _getDirectionText() {
     final bearing = _calculateBearing();
     if (bearing == null) return 'Searching...';
-    
+
     // Calculate relative bearing
     double relativeBearing = (bearing - myHeading + 360) % 360;
     return LocationService.getDirectionText(relativeBearing);
@@ -285,10 +389,7 @@ class _TrackingScreenAState extends State<TrackingScreenA>
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [
-              const Color(0xFF00D4AA),
-              const Color(0xFF00A896),
-            ],
+            colors: [const Color(0xFF00D4AA), const Color(0xFF00A896)],
           ),
         ),
         child: SafeArea(
@@ -328,8 +429,9 @@ class _TrackingScreenAState extends State<TrackingScreenA>
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: const [
                             CircularProgressIndicator(
-                              valueColor:
-                                  AlwaysStoppedAnimation<Color>(Colors.white),
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                Colors.white,
+                              ),
                             ),
                             SizedBox(height: 24),
                             Text(
@@ -495,11 +597,16 @@ class _TrackingScreenAState extends State<TrackingScreenA>
   @override
   void dispose() {
     _locationSubscription?.cancel();
+    _distanceLocationSubscription?.cancel();
+    _locationPollTimer?.cancel();
     _compassSubscription?.cancel();
     _friendLocationSubscription?.cancel();
+    _friendCommunityLocationSubscription?.cancel();
     _friendSessionLocationSubscription?.cancel();
     _bleSubscription?.cancel();
+    _distanceRefreshTimer?.cancel();
     _pulseController.dispose();
+    _arrowController.dispose();
     super.dispose();
   }
 }
@@ -518,12 +625,12 @@ class RealisticArrowPainter extends CustomPainter {
       ..strokeWidth = 3;
 
     final center = Offset(size.width / 2, size.height / 2);
-    
+
     // Arrow dimensions
     final arrowLength = size.height * 0.55; // 55% of container
-    final arrowWidth = size.width * 0.25;   // 25% of container
-    final headLength = arrowLength * 0.4;   // Arrow head is 40% of total length
-    final tailWidth = arrowWidth * 0.35;    // Tail is 35% of arrow width
+    final arrowWidth = size.width * 0.25; // 25% of container
+    final headLength = arrowLength * 0.4; // Arrow head is 40% of total length
+    final tailWidth = arrowWidth * 0.35; // Tail is 35% of arrow width
 
     final path = Path();
 
@@ -543,16 +650,10 @@ class RealisticArrowPainter extends CustomPainter {
     );
 
     // Right bottom of tail
-    path.lineTo(
-      center.dx + tailWidth / 2,
-      center.dy + arrowLength / 2,
-    );
+    path.lineTo(center.dx + tailWidth / 2, center.dy + arrowLength / 2);
 
     // Bottom center (tail end)
-    path.lineTo(
-      center.dx - tailWidth / 2,
-      center.dy + arrowLength / 2,
-    );
+    path.lineTo(center.dx - tailWidth / 2, center.dy + arrowLength / 2);
 
     // Left bottom of tail
     path.lineTo(
@@ -573,7 +674,7 @@ class RealisticArrowPainter extends CustomPainter {
     final shadowPaint = Paint()
       ..color = Colors.black.withOpacity(0.2)
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
-    
+
     canvas.drawPath(path.shift(const Offset(2, 2)), shadowPaint);
 
     // Draw main arrow

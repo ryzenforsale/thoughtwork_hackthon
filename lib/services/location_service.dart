@@ -1,5 +1,6 @@
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:async';
 import 'dart:math';
 
 class LocationService {
@@ -7,10 +8,10 @@ class LocationService {
   static Position? _lastPosition;
   static double _processNoise = 0.5; // How much we trust new measurements
   static double _measurementNoise = 4.0; // Expected GPS accuracy error
-  
+
   static const double MAX_DEMO_DISTANCE = 10.0;
   static bool _demoMode = false; // ✅ Default to OFF for production
-  
+
   // Request location permissions
   static Future<bool> requestPermission() async {
     final status = await Permission.location.request();
@@ -30,13 +31,15 @@ class LocationService {
 
       // ✅ IMPROVED: Use best accuracy settings
       final position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.bestForNavigation, // Changed from .high
+        desiredAccuracy:
+            LocationAccuracy.bestForNavigation, // Changed from .high
         timeLimit: const Duration(seconds: 10), // Timeout if GPS takes too long
       );
-      
+
       // Apply Kalman filter for smoothing
       final filteredPosition = _applyKalmanFilter(position);
-      
+      _lastPosition = filteredPosition;
+
       return filteredPosition;
     } catch (e) {
       print('❌ Error getting position: $e');
@@ -44,21 +47,25 @@ class LocationService {
     }
   }
 
-  // ✅ IMPROVED: Get position stream with better settings
+  // ✅ FIXED: Get position stream — NO timeLimit (was killing the stream),
+  // distanceFilter: 0 so updates arrive even when stationary.
   static Stream<Position> getPositionStream() {
     return Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.bestForNavigation, // Best accuracy
-        distanceFilter: 1, // Update every 1 meter
-        timeLimit: Duration(seconds: 10),
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0, // Always emit, even when standing still
       ),
     ).map((position) {
       // Filter out low-accuracy readings (more lenient for indoor)
       if (position.accuracy > 50) {
-        print('⚠️ Very low accuracy: ${position.accuracy}m - using last known position');
+        print(
+          '⚠️ Very low accuracy: ${position.accuracy}m - using last known position',
+        );
         return _lastPosition ?? position;
       }
-      return _applyKalmanFilter(position);
+      final filteredPosition = _applyKalmanFilter(position);
+      _lastPosition = filteredPosition;
+      return filteredPosition;
     });
   }
 
@@ -67,6 +74,71 @@ class LocationService {
   // ✅ NEW: Real Kalman filter to smooth GPS readings
   static Position _applyKalmanFilter(Position newPosition) {
     return _kalmanFilter.filter(newPosition);
+  }
+
+  // Raw positions are used for distance measurements and session publishing.
+  // The filtered stream remains available for stable navigation bearings.
+  static Future<Position?> getRawCurrentPosition() async {
+    try {
+      final hasPermission = await requestPermission();
+      if (!hasPermission) return null;
+      return await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.bestForNavigation,
+        timeLimit: const Duration(seconds: 15),
+      );
+    } catch (e) {
+      print('❌ Error getting raw position: $e');
+      return null;
+    }
+  }
+
+  // ✅ FIXED: Raw position stream that guarantees periodic updates.
+  // Uses a timer to poll getCurrentPosition every 2 seconds so that the
+  // distance display ALWAYS refreshes, even when the user is standing still
+  // (distanceFilter would suppress those events).
+  static Stream<Position> getRawPositionStream() {
+    late StreamController<Position> controller;
+    Timer? timer;
+    StreamSubscription<Position>? geoSub;
+
+    controller = StreamController<Position>(
+      onListen: () {
+        // Primary: listen to the platform stream for instant movement updates.
+        geoSub = Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 0,
+          ),
+        ).listen(
+          (pos) {
+            if (!controller.isClosed) controller.add(pos);
+          },
+          onError: (e) {
+            print('⚠️ Raw stream error: $e');
+          },
+        );
+
+        // Backup: poll every 3 seconds to guarantee freshness.
+        timer = Timer.periodic(const Duration(seconds: 3), (_) async {
+          try {
+            final pos = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.bestForNavigation,
+              timeLimit: const Duration(seconds: 5),
+            );
+            if (!controller.isClosed) controller.add(pos);
+          } catch (e) {
+            // Ignore — the stream listener above is the primary source.
+          }
+        });
+      },
+      onCancel: () {
+        timer?.cancel();
+        geoSub?.cancel();
+        controller.close();
+      },
+    );
+
+    return controller.stream;
   }
 
   // ✅ IMPROVED: Calculate distance with demo mode cap
@@ -81,7 +153,8 @@ class LocationService {
     final dLat = _toRadians(lat2 - lat1);
     final dLon = _toRadians(lon2 - lon1);
 
-    final a = sin(dLat / 2) * sin(dLat / 2) +
+    final a =
+        sin(dLat / 2) * sin(dLat / 2) +
         cos(_toRadians(lat1)) *
             cos(_toRadians(lat2)) *
             sin(dLon / 2) *
@@ -90,13 +163,15 @@ class LocationService {
     final c = 2 * atan2(sqrt(a), sqrt(1 - a));
 
     var distance = earthRadius * c; // Distance in meters
-    
+
     // ✅ DEMO MODE: Cap maximum distance for indoor presentations
     if (_demoMode && distance > MAX_DEMO_DISTANCE) {
-      print('🎯 [DEMO] Distance capped: ${distance.toStringAsFixed(1)}m → ${MAX_DEMO_DISTANCE}m');
+      print(
+        '🎯 [DEMO] Distance capped: ${distance.toStringAsFixed(1)}m → ${MAX_DEMO_DISTANCE}m',
+      );
       distance = MAX_DEMO_DISTANCE;
     }
-    
+
     // ✅ Removed 5m rounding
     return distance;
   }
@@ -111,19 +186,20 @@ class LocationService {
     final dLon = _toRadians(lon2 - lon1);
 
     final y = sin(dLon) * cos(_toRadians(lat2));
-    final x = cos(_toRadians(lat1)) * sin(_toRadians(lat2)) -
+    final x =
+        cos(_toRadians(lat1)) * sin(_toRadians(lat2)) -
         sin(_toRadians(lat1)) * cos(_toRadians(lat2)) * cos(dLon);
 
     final bearing = atan2(y, x);
     return (_toDegrees(bearing) + 360) % 360; // Normalize to 0-360
   }
 
-  // ✅ IMPROVED: Format distance with better precision for short distances
+  // Format distance with enough precision to show changing short-range readings.
   static String formatDistance(double meters) {
-    if (meters < 8) {
-      return '<10m'; // Show "less than 10m" for very close distances
+    if (meters < 1) {
+      return '${(meters * 100).round()}cm';
     } else if (meters < 100) {
-      return '${(meters / 5).round() * 5}m'; // Round to nearest 5m
+      return '${meters.toStringAsFixed(1)}m';
     } else if (meters < 1000) {
       return '${meters.round()}m';
     } else if (meters < 10000) {
@@ -161,17 +237,17 @@ class LocationService {
       if (!hasPermission) return null;
 
       List<Position> positions = [];
-      
+
       for (int i = 0; i < samples; i++) {
         final pos = await Geolocator.getCurrentPosition(
           desiredAccuracy: LocationAccuracy.bestForNavigation,
         );
-        
+
         // More lenient for indoor (accept up to 40m accuracy)
         if (pos.accuracy <= 40) {
           positions.add(pos);
         }
-        
+
         // Wait a bit between samples
         if (i < samples - 1) {
           await Future.delayed(const Duration(milliseconds: 500));
@@ -184,11 +260,19 @@ class LocationService {
       }
 
       // Average the positions
-      double avgLat = positions.map((p) => p.latitude).reduce((a, b) => a + b) / positions.length;
-      double avgLon = positions.map((p) => p.longitude).reduce((a, b) => a + b) / positions.length;
-      double avgAcc = positions.map((p) => p.accuracy).reduce((a, b) => a + b) / positions.length;
+      double avgLat =
+          positions.map((p) => p.latitude).reduce((a, b) => a + b) /
+          positions.length;
+      double avgLon =
+          positions.map((p) => p.longitude).reduce((a, b) => a + b) /
+          positions.length;
+      double avgAcc =
+          positions.map((p) => p.accuracy).reduce((a, b) => a + b) /
+          positions.length;
 
-      print('✅ Averaged ${positions.length} positions. Accuracy: ${avgAcc.toStringAsFixed(1)}m');
+      print(
+        '✅ Averaged ${positions.length} positions. Accuracy: ${avgAcc.toStringAsFixed(1)}m',
+      );
 
       return Position(
         latitude: avgLat,
@@ -209,7 +293,11 @@ class LocationService {
   }
 
   // ✅ NEW: Check if distance is accurate enough
-  static bool isDistanceReliable(double distance, double accuracy1, double accuracy2) {
+  static bool isDistanceReliable(
+    double distance,
+    double accuracy1,
+    double accuracy2,
+  ) {
     // If combined accuracy is larger than distance, it's unreliable
     final combinedAccuracy = accuracy1 + accuracy2;
     return distance > combinedAccuracy;
@@ -220,13 +308,15 @@ class LocationService {
     _lastPosition = null;
     _kalmanFilter.reset();
   }
-  
+
   // ✅ NEW: Enable/disable demo mode (caps distance at 10m)
   static void setDemoMode(bool enabled) {
     _demoMode = enabled;
-    print('🎯 [DEMO] Demo mode ${enabled ? "ENABLED" : "DISABLED"} - Max distance: ${enabled ? "${MAX_DEMO_DISTANCE}m" : "unlimited"}');
+    print(
+      '🎯 [DEMO] Demo mode ${enabled ? "ENABLED" : "DISABLED"} - Max distance: ${enabled ? "${MAX_DEMO_DISTANCE}m" : "unlimited"}',
+    );
   }
-  
+
   // ✅ NEW: Check if in demo mode
   static bool get isDemoMode => _demoMode;
 
@@ -244,12 +334,15 @@ class PositionKalmanFilter {
   double _estimateLat = 0;
   double _estimateLon = 0;
   double _errorCovariance = 100.0; // Initial uncertainty (large)
-  double _processNoise = 0.00001;  // How much position changes between updates
+  // Covariance is measured in square metres. A larger process noise keeps the
+  // estimate responsive when either phone is moving instead of holding the
+  // first GPS fix for too long.
+  double _processNoise = 100.0;
   bool _initialized = false;
 
   Position filter(Position measurement) {
     final measurementNoise = measurement.accuracy * measurement.accuracy; // σ²
-    
+
     if (!_initialized) {
       _estimateLat = measurement.latitude;
       _estimateLon = measurement.longitude;
@@ -263,7 +356,7 @@ class PositionKalmanFilter {
 
     // Update step
     final kalmanGain = _errorCovariance / (_errorCovariance + measurementNoise);
-    
+
     _estimateLat += kalmanGain * (measurement.latitude - _estimateLat);
     _estimateLon += kalmanGain * (measurement.longitude - _estimateLon);
     _errorCovariance *= (1 - kalmanGain);

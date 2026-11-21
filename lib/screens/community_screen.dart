@@ -1,8 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart' as ll;
 import 'dart:async';
 import 'dart:math';
+import '../services/bluetooth_distance_service.dart';
 import '../services/firebase_service.dart';
+import '../services/location_service.dart';
+import '../services/tinyfish_places_service.dart';
 import 'tracking_screen_a.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,9 +74,12 @@ class _CommunityScreenState extends State<CommunityScreen>
 
   // ── UI state ────────────────────────────────────────────────────────────────
   late AnimationController _radarCtrl;
-  String _filter = 'all'; // 'all' | 'in_zone' | 'out_zone'
+  String _filter = 'all'; // 'all' | 'in_zone' | 'out_zone' | 'near_you'
   CommunityMember? _selectedMember;
   double _simOffset = 0.0; // for simulation slider
+  List<TinyFishPlace> _nearbyHospitals = const [];
+  bool _nearbyHospitalsLoading = false;
+  String? _nearbyHospitalsError;
 
   // ── Tabs ────────────────────────────────────────────────────────────────────
   // 0 = Contacts (pick people), 1 = Radar
@@ -92,22 +100,17 @@ class _CommunityScreenState extends State<CommunityScreen>
   // ── Location ────────────────────────────────────────────────────────────────
   Future<void> _initLocation() async {
     try {
-      LocationPermission perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
-      }
-      if (perm == LocationPermission.always ||
-          perm == LocationPermission.whileInUse) {
-        final pos = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high);
+      LocationService.resetFilter();
+      final hasPermission = await LocationService.requestPermission();
+      if (hasPermission) {
+        await BluetoothDistanceService.startAdvertising(widget.deviceId);
+        final pos = await LocationService.getRawCurrentPosition();
+        if (pos == null) return;
         if (!mounted) return;
         setState(() => _myPosition = pos);
         _broadcastLocation(pos);
 
-        _positionSub = Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-              accuracy: LocationAccuracy.high, distanceFilter: 2),
-        ).listen((pos) {
+        _positionSub = LocationService.getRawPositionStream().listen((pos) {
           if (!mounted) return;
           setState(() => _myPosition = pos);
           _broadcastLocation(pos);
@@ -120,7 +123,11 @@ class _CommunityScreenState extends State<CommunityScreen>
 
   void _broadcastLocation(Position pos) {
     FirebaseService.updateDeviceLocation(
-        widget.deviceId, pos.latitude, pos.longitude, pos.heading);
+      widget.deviceId,
+      pos.latitude,
+      pos.longitude,
+      pos.heading,
+    );
     FirebaseService.updateCommunityLocation(
       deviceId: widget.deviceId,
       name: widget.deviceName,
@@ -136,16 +143,17 @@ class _CommunityScreenState extends State<CommunityScreen>
       if (!mounted) return;
       setState(() {
         // Filter out self
-        _allContacts =
-            contacts.where((c) => c['id'] != widget.deviceId).toList();
-        
+        _allContacts = contacts
+            .where((c) => c['id'] != widget.deviceId)
+            .toList();
+
         // Sort: online first, then by name
         _allContacts.sort((a, b) {
           final bool aOnline = a['online'] == true;
           final bool bOnline = b['online'] == true;
           if (aOnline && !bOnline) return -1;
           if (!aOnline && bOnline) return 1;
-          
+
           final String aName = (a['name'] as String? ?? '').toLowerCase();
           final String bName = (b['name'] as String? ?? '').toLowerCase();
           return aName.compareTo(bName);
@@ -173,9 +181,17 @@ class _CommunityScreenState extends State<CommunityScreen>
         lat = (contact['lat'] as num).toDouble();
         lng = (contact['lng'] as num).toDouble();
         distance = Geolocator.distanceBetween(
-            _myPosition!.latitude, _myPosition!.longitude, lat, lng);
+          _myPosition!.latitude,
+          _myPosition!.longitude,
+          lat,
+          lng,
+        );
         bearing = Geolocator.bearingBetween(
-            _myPosition!.latitude, _myPosition!.longitude, lat, lng);
+          _myPosition!.latitude,
+          _myPosition!.longitude,
+          lat,
+          lng,
+        );
         bearing = (bearing + 360) % 360;
         hasLoc = true;
       } else {
@@ -189,23 +205,27 @@ class _CommunityScreenState extends State<CommunityScreen>
       // Apply simulation offset (clamp to keep on radar)
       final adjustedDist = (distance + _simOffset).clamp(2.0, 150.0);
 
-      members.add(CommunityMember(
-        id: id,
-        name: contact['name'] as String? ?? 'Device $id',
-        distance: adjustedDist,
-        bearing: bearing,
-        lat: lat,
-        lng: lng,
-        hasLocation: hasLoc,
-      ));
+      members.add(
+        CommunityMember(
+          id: id,
+          name: contact['name'] as String? ?? 'Device $id',
+          distance: adjustedDist,
+          bearing: bearing,
+          lat: lat,
+          lng: lng,
+          hasLocation: hasLoc,
+        ),
+      );
     }
     return members;
   }
 
   // ── Track an out-of-zone person 1-on-1 ──────────────────────────────────────
   Future<void> _trackPerson(CommunityMember m) async {
-    final sessionId =
-        await FirebaseService.startDirectSession(widget.deviceId, m.id);
+    final sessionId = await FirebaseService.startDirectSession(
+      widget.deviceId,
+      m.id,
+    );
     if (!mounted) return;
     Navigator.push(
       context,
@@ -220,9 +240,46 @@ class _CommunityScreenState extends State<CommunityScreen>
     );
   }
 
+  Future<void> _loadNearbyHospitals() async {
+    final position = _myPosition;
+    if (position == null) {
+      setState(() {
+        _nearbyHospitalsError = 'Waiting for your location...';
+      });
+      return;
+    }
+
+    setState(() {
+      _nearbyHospitalsLoading = true;
+      _nearbyHospitalsError = null;
+    });
+
+    try {
+      final hospitals = await TinyFishPlacesService.searchNearbyHospitals(
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
+      if (!mounted) return;
+      setState(() => _nearbyHospitals = hospitals);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _nearbyHospitalsError = error.toString());
+    } finally {
+      if (mounted) setState(() => _nearbyHospitalsLoading = false);
+    }
+  }
+
+  void _selectFilter(String filter) {
+    setState(() => _filter = filter);
+    if (filter == 'near_you' && _nearbyHospitals.isEmpty) {
+      _loadNearbyHospitals();
+    }
+  }
+
   @override
   void dispose() {
     _positionSub?.cancel();
+    BluetoothDistanceService.stopAdvertising();
     _contactsSub?.cancel();
     _communityInviteListener?.cancel();
     // Cancel all pending invite response listeners
@@ -262,8 +319,11 @@ class _CommunityScreenState extends State<CommunityScreen>
   }
 
   // ── AppBar ──────────────────────────────────────────────────────────────────
-  AppBar _buildAppBar(List<CommunityMember> members,
-      List<CommunityMember> inZone, List<CommunityMember> outZone) {
+  AppBar _buildAppBar(
+    List<CommunityMember> members,
+    List<CommunityMember> inZone,
+    List<CommunityMember> outZone,
+  ) {
     return AppBar(
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -271,7 +331,10 @@ class _CommunityScreenState extends State<CommunityScreen>
           Text(
             '${widget.communityName} Radar',
             style: const TextStyle(
-                fontSize: 17, fontWeight: FontWeight.bold, letterSpacing: -0.5),
+              fontSize: 17,
+              fontWeight: FontWeight.bold,
+              letterSpacing: -0.5,
+            ),
           ),
           Text(
             '${_communityIds.length} members selected',
@@ -286,8 +349,7 @@ class _CommunityScreenState extends State<CommunityScreen>
         if (_tab == 1)
           IconButton(
             tooltip: 'Simulate movement',
-            icon:
-                const Icon(Icons.tune_rounded, color: Color(0xFF2DD4BF)),
+            icon: const Icon(Icons.tune_rounded, color: Color(0xFF2DD4BF)),
             onPressed: _showSimDialog,
           ),
       ],
@@ -324,19 +386,18 @@ class _CommunityScreenState extends State<CommunityScreen>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon,
-                color:
-                    active ? const Color(0xFF2DD4BF) : Colors.grey.shade500,
-                size: 22),
+            Icon(
+              icon,
+              color: active ? const Color(0xFF2DD4BF) : Colors.grey.shade500,
+              size: 22,
+            ),
             const SizedBox(height: 3),
             Text(
               label,
               style: TextStyle(
                 fontSize: 11.5,
                 fontWeight: active ? FontWeight.bold : FontWeight.normal,
-                color: active
-                    ? const Color(0xFF2DD4BF)
-                    : Colors.grey.shade500,
+                color: active ? const Color(0xFF2DD4BF) : Colors.grey.shade500,
               ),
             ),
           ],
@@ -364,15 +425,18 @@ class _CommunityScreenState extends State<CommunityScreen>
                     const Text(
                       'Select Community Members',
                       style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold),
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       'All online contacts from your network. Tap to add or remove from your community group.',
                       style: TextStyle(
-                          color: Colors.grey.shade400, fontSize: 12),
+                        color: Colors.grey.shade400,
+                        fontSize: 12,
+                      ),
                     ),
                   ],
                 ),
@@ -382,7 +446,9 @@ class _CommunityScreenState extends State<CommunityScreen>
                   onTap: () => setState(() => _tab = 1),
                   child: Container(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 8),
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
                     decoration: BoxDecoration(
                       color: const Color(0xFF2DD4BF),
                       borderRadius: BorderRadius.circular(20),
@@ -393,13 +459,17 @@ class _CommunityScreenState extends State<CommunityScreen>
                         Text(
                           'View Radar (${_communityIds.length})',
                           style: const TextStyle(
-                              color: Color(0xFF0F172A),
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold),
+                            color: Color(0xFF0F172A),
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                         const SizedBox(width: 4),
-                        const Icon(Icons.arrow_forward_rounded,
-                            size: 14, color: Color(0xFF0F172A)),
+                        const Icon(
+                          Icons.arrow_forward_rounded,
+                          size: 14,
+                          color: Color(0xFF0F172A),
+                        ),
                       ],
                     ),
                   ),
@@ -410,20 +480,23 @@ class _CommunityScreenState extends State<CommunityScreen>
 
         // Search hint / online count
         Container(
-          padding:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           color: const Color(0xFF131D2E),
           child: Row(
             children: [
-              const Icon(Icons.wifi_tethering_rounded,
-                  size: 14, color: Color(0xFF2DD4BF)),
+              const Icon(
+                Icons.wifi_tethering_rounded,
+                size: 14,
+                color: Color(0xFF2DD4BF),
+              ),
               const SizedBox(width: 6),
               Text(
                 '${_allContacts.length} contact${_allContacts.length != 1 ? "s" : ""} online right now',
                 style: const TextStyle(
-                    color: Color(0xFF2DD4BF),
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600),
+                  color: Color(0xFF2DD4BF),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
               const Spacer(),
               if (_communityIds.isNotEmpty)
@@ -432,9 +505,10 @@ class _CommunityScreenState extends State<CommunityScreen>
                   child: Text(
                     'Clear all',
                     style: TextStyle(
-                        color: Colors.red.shade400,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600),
+                      color: Colors.red.shade400,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
             ],
@@ -447,18 +521,24 @@ class _CommunityScreenState extends State<CommunityScreen>
               ? _emptyContacts()
               : ListView.builder(
                   padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 10),
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
                   itemCount: _allContacts.length,
                   itemBuilder: (context, index) {
                     final contact = _allContacts[index];
                     final id = contact['id'] as String? ?? '';
-                    final name =
-                        contact['name'] as String? ?? 'Unknown Device';
+                    final name = contact['name'] as String? ?? 'Unknown Device';
                     final selected = _communityIds.contains(id);
                     final hasLoc = contact['lat'] != null;
 
                     return _buildContactTile(
-                        id, name, selected, hasLoc, contact);
+                      id,
+                      name,
+                      selected,
+                      hasLoc,
+                      contact,
+                    );
                   },
                 ),
         ),
@@ -471,50 +551,55 @@ class _CommunityScreenState extends State<CommunityScreen>
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.signal_wifi_off_rounded,
-              size: 52, color: Colors.grey.shade600),
+          Icon(
+            Icons.signal_wifi_off_rounded,
+            size: 52,
+            color: Colors.grey.shade600,
+          ),
           const SizedBox(height: 16),
           Text(
             'No contacts online',
             style: TextStyle(
-                color: Colors.grey.shade300,
-                fontSize: 17,
-                fontWeight: FontWeight.bold),
+              color: Colors.grey.shade300,
+              fontSize: 17,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 8),
           Text(
             'Waiting for other users to come online.\nAsk your friends to open the app!',
             textAlign: TextAlign.center,
-            style:
-                TextStyle(color: Colors.grey.shade500, fontSize: 13),
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildContactTile(String id, String name, bool selected,
-      bool hasLoc, Map<String, dynamic> contact) {
+  Widget _buildContactTile(
+    String id,
+    String name,
+    bool selected,
+    bool hasLoc,
+    Map<String, dynamic> contact,
+  ) {
     final isPending = _pendingInvites.containsKey(id);
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: selected
-            ? const Color(0xFF0D2B2B)
-            : const Color(0xFF182234),
+        color: selected ? const Color(0xFF0D2B2B) : const Color(0xFF182234),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: selected
               ? const Color(0xFF2DD4BF)
               : isPending
-                  ? const Color(0xFFF59E0B)
-                  : Colors.white.withOpacity(0.06),
+              ? const Color(0xFFF59E0B)
+              : Colors.white.withOpacity(0.06),
           width: (selected || isPending) ? 1.5 : 1,
         ),
       ),
       child: ListTile(
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
         leading: Stack(
           children: [
             CircleAvatar(
@@ -522,14 +607,12 @@ class _CommunityScreenState extends State<CommunityScreen>
               backgroundColor: selected
                   ? const Color(0xFF2DD4BF)
                   : isPending
-                      ? const Color(0xFFF59E0B).withOpacity(0.3)
-                      : const Color(0xFF1E3A5F),
+                  ? const Color(0xFFF59E0B).withOpacity(0.3)
+                  : const Color(0xFF1E3A5F),
               child: Text(
                 name.isNotEmpty ? name[0].toUpperCase() : '?',
                 style: TextStyle(
-                  color: selected
-                      ? const Color(0xFF0F172A)
-                      : Colors.white,
+                  color: selected ? const Color(0xFF0F172A) : Colors.white,
                   fontWeight: FontWeight.bold,
                   fontSize: 16,
                 ),
@@ -546,7 +629,9 @@ class _CommunityScreenState extends State<CommunityScreen>
                     color: const Color(0xFF10B981),
                     shape: BoxShape.circle,
                     border: Border.all(
-                        color: const Color(0xFF182234), width: 1.5),
+                      color: const Color(0xFF182234),
+                      width: 1.5,
+                    ),
                   ),
                 ),
               ),
@@ -567,9 +652,7 @@ class _CommunityScreenState extends State<CommunityScreen>
           style: TextStyle(
             fontSize: 11,
             fontFamily: 'monospace',
-            color: hasLoc
-                ? const Color(0xFF34D399)
-                : Colors.grey.shade500,
+            color: hasLoc ? const Color(0xFF34D399) : Colors.grey.shade500,
           ),
         ),
         trailing: GestureDetector(
@@ -593,15 +676,15 @@ class _CommunityScreenState extends State<CommunityScreen>
               color: selected
                   ? const Color(0xFF2DD4BF)
                   : isPending
-                      ? const Color(0xFFF59E0B).withOpacity(0.2)
-                      : Colors.white.withOpacity(0.08),
+                  ? const Color(0xFFF59E0B).withOpacity(0.2)
+                  : Colors.white.withOpacity(0.08),
               borderRadius: BorderRadius.circular(10),
               border: Border.all(
                 color: selected
                     ? const Color(0xFF2DD4BF)
                     : isPending
-                        ? const Color(0xFFF59E0B)
-                        : Colors.white.withOpacity(0.15),
+                    ? const Color(0xFFF59E0B)
+                    : Colors.white.withOpacity(0.15),
               ),
             ),
             child: Center(
@@ -612,30 +695,30 @@ class _CommunityScreenState extends State<CommunityScreen>
                     selected
                         ? Icons.check_rounded
                         : isPending
-                            ? Icons.hourglass_top_rounded
-                            : Icons.send_rounded,
+                        ? Icons.hourglass_top_rounded
+                        : Icons.send_rounded,
                     size: 13,
                     color: selected
                         ? const Color(0xFF0F172A)
                         : isPending
-                            ? const Color(0xFFF59E0B)
-                            : Colors.white,
+                        ? const Color(0xFFF59E0B)
+                        : Colors.white,
                   ),
                   const SizedBox(width: 4),
                   Text(
                     selected
                         ? 'Added'
                         : isPending
-                            ? 'Pending'
-                            : 'Invite',
+                        ? 'Pending'
+                        : 'Invite',
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.bold,
                       color: selected
                           ? const Color(0xFF0F172A)
                           : isPending
-                              ? const Color(0xFFF59E0B)
-                              : Colors.white,
+                          ? const Color(0xFFF59E0B)
+                          : Colors.white,
                     ),
                   ),
                 ],
@@ -671,7 +754,9 @@ class _CommunityScreenState extends State<CommunityScreen>
                   child: LayoutBuilder(
                     builder: (ctx, constraints) {
                       final size = min(
-                          constraints.maxWidth, constraints.maxHeight);
+                        constraints.maxWidth,
+                        constraints.maxHeight,
+                      );
                       return Center(
                         child: SizedBox(
                           width: size,
@@ -684,18 +769,13 @@ class _CommunityScreenState extends State<CommunityScreen>
                                 builder: (ctx, _) => CustomPaint(
                                   size: Size(size, size),
                                   painter: RadarZonePainter(
-                                    sweepAngle:
-                                        _radarCtrl.value * 2 * pi,
+                                    sweepAngle: _radarCtrl.value * 2 * pi,
                                   ),
                                 ),
                               ),
                               _buildYouMarker(),
-                              ...members.map((m) =>
-                                  _buildMemberNode(m, size)),
-                              Positioned(
-                                bottom: 10,
-                                child: _buildLegend(),
-                              ),
+                              ...members.map((m) => _buildMemberNode(m, size)),
+                              Positioned(bottom: 10, child: _buildLegend()),
                             ],
                           ),
                         ),
@@ -709,31 +789,151 @@ class _CommunityScreenState extends State<CommunityScreen>
         _buildFilterBar(members.length, inZone.length, outZone.length),
 
         // Member list
-        Expanded(
-          flex: 4,
-          child: Container(
-            color: const Color(0xFF131D2E),
-            child: displayed.isEmpty
-                ? Center(
-                    child: Text(
-                      _communityIds.isEmpty
-                          ? 'Add members in the Contacts tab'
-                          : 'No members match this filter',
-                      style: TextStyle(
-                          color: Colors.grey.shade400, fontSize: 14),
-                      textAlign: TextAlign.center,
+        if (_filter == 'near_you')
+          Expanded(flex: 4, child: _buildNearbyHospitalsPanel())
+        else
+          Expanded(
+            flex: 4,
+            child: Container(
+              color: const Color(0xFF131D2E),
+              child: displayed.isEmpty
+                  ? Center(
+                      child: Text(
+                        _communityIds.isEmpty
+                            ? 'Add members in the Contacts tab'
+                            : 'No members match this filter',
+                        style: TextStyle(
+                          color: Colors.grey.shade400,
+                          fontSize: 14,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      itemCount: displayed.length,
+                      itemBuilder: (ctx, i) => _buildMemberCard(displayed[i]),
                     ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 10),
-                    itemCount: displayed.length,
-                    itemBuilder: (ctx, i) =>
-                        _buildMemberCard(displayed[i]),
-                  ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildNearbyHospitalsPanel() {
+    if (_nearbyHospitalsLoading) {
+      return const ColoredBox(
+        color: Color(0xFF131D2E),
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_nearbyHospitalsError != null) {
+      return ColoredBox(
+        color: const Color(0xFF131D2E),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, color: Colors.orange, size: 36),
+                const SizedBox(height: 12),
+                Text(
+                  _nearbyHospitalsError!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey.shade300),
+                ),
+                const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  onPressed: _loadNearbyHospitals,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Retry'),
+                ),
+              ],
+            ),
           ),
         ),
-      ],
+      );
+    }
+
+    if (_nearbyHospitals.isEmpty) {
+      return ColoredBox(
+        color: const Color(0xFF131D2E),
+        child: Center(
+          child: Text(
+            'No nearby hospitals found',
+            style: TextStyle(color: Colors.grey.shade400),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      color: const Color(0xFF131D2E),
+      child: ListView.separated(
+        padding: const EdgeInsets.all(12),
+        itemCount: _nearbyHospitals.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        itemBuilder: (context, index) {
+          final hospital = _nearbyHospitals[index];
+          return Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E293B),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.local_hospital, color: Color(0xFF2DD4BF)),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        hospital.title,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (hospital.snippet.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    hospital.snippet,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: Colors.grey.shade300, fontSize: 12),
+                  ),
+                ],
+                if (hospital.url.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    hospital.siteName.isEmpty
+                        ? hospital.url
+                        : hospital.siteName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFF5EEAD4),
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -742,19 +942,22 @@ class _CommunityScreenState extends State<CommunityScreen>
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.group_add_rounded,
-              size: 60, color: Colors.grey.shade700),
+          Icon(Icons.group_add_rounded, size: 60, color: Colors.grey.shade700),
           const SizedBox(height: 16),
-          Text('No community members yet',
-              style: TextStyle(
-                  color: Colors.grey.shade300,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold)),
+          Text(
+            'No community members yet',
+            style: TextStyle(
+              color: Colors.grey.shade300,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           const SizedBox(height: 8),
-          Text('Go to the Contacts tab to\nadd people to your community.',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  color: Colors.grey.shade500, fontSize: 13)),
+          Text(
+            'Go to the Contacts tab to\nadd people to your community.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+          ),
           const SizedBox(height: 20),
           ElevatedButton.icon(
             onPressed: () => setState(() => _tab = 0),
@@ -764,7 +967,8 @@ class _CommunityScreenState extends State<CommunityScreen>
               backgroundColor: const Color(0xFF2DD4BF),
               foregroundColor: const Color(0xFF0F172A),
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
           ),
         ],
@@ -783,9 +987,7 @@ class _CommunityScreenState extends State<CommunityScreen>
             hasAlert
                 ? Icons.warning_amber_rounded
                 : Icons.check_circle_outline_rounded,
-            color: hasAlert
-                ? const Color(0xFFFF6B6B)
-                : const Color(0xFF4ADE80),
+            color: hasAlert ? const Color(0xFFFF6B6B) : const Color(0xFF4ADE80),
             size: 18,
           ),
           const SizedBox(width: 8),
@@ -794,8 +996,8 @@ class _CommunityScreenState extends State<CommunityScreen>
               hasAlert
                   ? '${outZone.length} member${outZone.length > 1 ? "s" : ""} out of 50 m zone!'
                   : _communityIds.isEmpty
-                      ? 'No members added yet — go to Contacts'
-                      : 'All community members inside 50 m zone ✓',
+                  ? 'No members added yet — go to Contacts'
+                  : 'All community members inside 50 m zone ✓',
               style: TextStyle(
                 color: hasAlert
                     ? const Color(0xFFFFE3E3)
@@ -806,17 +1008,19 @@ class _CommunityScreenState extends State<CommunityScreen>
             ),
           ),
           Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
             decoration: BoxDecoration(
               color: Colors.black.withOpacity(0.35),
               borderRadius: BorderRadius.circular(8),
             ),
-            child: Text('Zone: 50 m',
-                style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.teal.shade200)),
+            child: Text(
+              'Zone: 50 m',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: Colors.teal.shade200,
+              ),
+            ),
           ),
         ],
       ),
@@ -827,16 +1031,27 @@ class _CommunityScreenState extends State<CommunityScreen>
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       color: const Color(0xFF1E293B),
-      child: Row(
-        children: [
-          _filterChip('all', 'All ($all)'),
-          const SizedBox(width: 8),
-          _filterChip('in_zone', 'In Zone ($inZ)',
-              color: const Color(0xFF10B981)),
-          const SizedBox(width: 8),
-          _filterChip('out_zone', 'Out ($outZ)',
-              color: const Color(0xFFEF4444)),
-        ],
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _filterChip('all', 'All ($all)'),
+            const SizedBox(width: 8),
+            _filterChip(
+              'in_zone',
+              'In Zone ($inZ)',
+              color: const Color(0xFF10B981),
+            ),
+            const SizedBox(width: 8),
+            _filterChip(
+              'out_zone',
+              'Out ($outZ)',
+              color: const Color(0xFFEF4444),
+            ),
+            const SizedBox(width: 8),
+            _filterChip('near_you', 'Near You', color: const Color(0xFF0EA5E9)),
+          ],
+        ),
       ),
     );
   }
@@ -845,19 +1060,17 @@ class _CommunityScreenState extends State<CommunityScreen>
     final active = _filter == key;
     return InkWell(
       borderRadius: BorderRadius.circular(20),
-      onTap: () => setState(() => _filter = key),
+      onTap: () => _selectFilter(key),
       child: Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
           color: active
               ? (color ?? const Color(0xFF2DD4BF))
               : Colors.white.withOpacity(0.06),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-              color: active
-                  ? Colors.transparent
-                  : Colors.white.withOpacity(0.12)),
+            color: active ? Colors.transparent : Colors.white.withOpacity(0.12),
+          ),
         ),
         child: Text(
           label,
@@ -865,9 +1078,7 @@ class _CommunityScreenState extends State<CommunityScreen>
             fontSize: 11.5,
             fontWeight: active ? FontWeight.bold : FontWeight.w500,
             color: active
-                ? (color != null
-                    ? Colors.white
-                    : const Color(0xFF0F172A))
+                ? (color != null ? Colors.white : const Color(0xFF0F172A))
                 : Colors.grey.shade300,
           ),
         ),
@@ -878,33 +1089,36 @@ class _CommunityScreenState extends State<CommunityScreen>
   // ── Incoming Community Invites ───────────────────────────────────────────────
   void _listenForCommunityInvites() {
     _communityInviteListener =
-        FirebaseService.listenForCommunityInvites(widget.deviceId!).listen(
-      (invites) async {
-        // Only handle pending invites
-        final pending = invites
-            .where((i) => (i['status'] as String? ?? '') == 'pending')
-            .toList();
-        for (final invite in pending) {
-          final key = invite['_key'] as String;
-          final fromId = invite['fromId'] as String? ?? '';
-          final fromName = invite['fromName'] as String? ?? fromId;
-          final communityName =
-              invite['communityName'] as String? ?? 'a community';
-          if (!mounted) return;
-          _showCommunityInviteDialog(key, fromId, fromName, communityName);
-        }
-      },
-    );
+        FirebaseService.listenForCommunityInvites(widget.deviceId!).listen((
+          invites,
+        ) async {
+          // Only handle pending invites
+          final pending = invites
+              .where((i) => (i['status'] as String? ?? '') == 'pending')
+              .toList();
+          for (final invite in pending) {
+            final key = invite['_key'] as String;
+            final fromId = invite['fromId'] as String? ?? '';
+            final fromName = invite['fromName'] as String? ?? fromId;
+            final communityName =
+                invite['communityName'] as String? ?? 'a community';
+            if (!mounted) return;
+            _showCommunityInviteDialog(key, fromId, fromName, communityName);
+          }
+        });
   }
 
   void _showCommunityInviteDialog(
-      String inviteKey, String fromId, String fromName, String communityName) {
+    String inviteKey,
+    String fromId,
+    String fromName,
+    String communityName,
+  ) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (_) => Dialog(
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         child: Container(
           padding: const EdgeInsets.all(24),
           decoration: BoxDecoration(
@@ -925,42 +1139,51 @@ class _CommunityScreenState extends State<CommunityScreen>
                   color: Colors.white.withOpacity(0.12),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.group_add_rounded,
-                    size: 44, color: Colors.white),
+                child: const Icon(
+                  Icons.group_add_rounded,
+                  size: 44,
+                  color: Colors.white,
+                ),
               ),
               const SizedBox(height: 18),
               const Text(
                 'Community Invite',
                 style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white),
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
               ),
               const SizedBox(height: 10),
               RichText(
                 textAlign: TextAlign.center,
                 text: TextSpan(
                   style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.white.withOpacity(0.85)),
+                    fontSize: 14,
+                    color: Colors.white.withOpacity(0.85),
+                  ),
                   children: [
                     TextSpan(
-                        text: fromName,
-                        style: const TextStyle(
-                            fontWeight: FontWeight.bold)),
+                      text: fromName,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
                     const TextSpan(text: ' wants to add you to\n'),
                     TextSpan(
-                        text: '"$communityName"',
-                        style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF2DD4BF))),
+                      text: '"$communityName"',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF2DD4BF),
+                      ),
+                    ),
                   ],
                 ),
               ),
               const SizedBox(height: 8),
               Container(
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 12, vertical: 6),
+                  horizontal: 12,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(20),
@@ -968,9 +1191,10 @@ class _CommunityScreenState extends State<CommunityScreen>
                 child: Text(
                   'ID: ${fromId.substring(0, fromId.length >= 8 ? 8 : fromId.length).toUpperCase()}',
                   style: const TextStyle(
-                      color: Colors.white,
-                      fontFamily: 'monospace',
-                      fontSize: 12),
+                    color: Colors.white,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  ),
                 ),
               ),
               const SizedBox(height: 24),
@@ -986,23 +1210,27 @@ class _CommunityScreenState extends State<CommunityScreen>
                           accepted: false,
                         );
                         // Clean up after a short delay
-                        await Future.delayed(
-                            const Duration(seconds: 2));
+                        await Future.delayed(const Duration(seconds: 2));
                         await FirebaseService.clearCommunityInvite(
-                            widget.deviceId!, inviteKey);
+                          widget.deviceId!,
+                          inviteKey,
+                        );
                       },
                       style: OutlinedButton.styleFrom(
                         foregroundColor: Colors.white,
                         side: const BorderSide(
-                            color: Colors.white54, width: 1.5),
+                          color: Colors.white54,
+                          width: 1.5,
+                        ),
                         shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
-                        padding:
-                            const EdgeInsets.symmetric(vertical: 12),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
-                      child: const Text('Decline',
-                          style: TextStyle(
-                              fontWeight: FontWeight.bold)),
+                      child: const Text(
+                        'Decline',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -1015,7 +1243,7 @@ class _CommunityScreenState extends State<CommunityScreen>
                           inviteKey: inviteKey,
                           accepted: true,
                         );
-                        
+
                         // ✅ Mutually add the sender to OUR community
                         if (mounted) {
                           setState(() {
@@ -1024,17 +1252,16 @@ class _CommunityScreenState extends State<CommunityScreen>
                         }
 
                         // Clean up after sender reads the response
-                        await Future.delayed(
-                            const Duration(seconds: 3));
+                        await Future.delayed(const Duration(seconds: 3));
                         await FirebaseService.clearCommunityInvite(
-                            widget.deviceId!, inviteKey);
+                          widget.deviceId!,
+                          inviteKey,
+                        );
                         if (!mounted) return;
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
-                            content: Text(
-                                'You joined "$communityName"!'),
-                            backgroundColor:
-                                const Color(0xFF059669),
+                            content: Text('You joined "$communityName"!'),
+                            backgroundColor: const Color(0xFF059669),
                           ),
                         );
                       },
@@ -1042,13 +1269,14 @@ class _CommunityScreenState extends State<CommunityScreen>
                         backgroundColor: const Color(0xFF2DD4BF),
                         foregroundColor: const Color(0xFF0F172A),
                         shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
-                        padding:
-                            const EdgeInsets.symmetric(vertical: 12),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
-                      child: const Text('Accept',
-                          style: TextStyle(
-                              fontWeight: FontWeight.bold)),
+                      child: const Text(
+                        'Accept',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ),
                   ),
                 ],
@@ -1061,7 +1289,10 @@ class _CommunityScreenState extends State<CommunityScreen>
   }
 
   // ── Send community invite and wait for response ───────────────────────────────
-  Future<void> _sendCommunityInvite(String contactId, String contactName) async {
+  Future<void> _sendCommunityInvite(
+    String contactId,
+    String contactName,
+  ) async {
     // Don't double-send
     if (_pendingInvites.containsKey(contactId)) return;
 
@@ -1080,42 +1311,47 @@ class _CommunityScreenState extends State<CommunityScreen>
     setState(() => _pendingInvites[contactId] = {'inviteKey': inviteKey});
 
     // Listen for the response
-    final sub = FirebaseService.listenForCommunityInviteResponse(
-      targetId: contactId,
-      inviteKey: inviteKey,
-    ).listen((status) async {
-      if (status == null || status == 'pending') return;
+    final sub =
+        FirebaseService.listenForCommunityInviteResponse(
+          targetId: contactId,
+          inviteKey: inviteKey,
+        ).listen((status) async {
+          if (status == null || status == 'pending') return;
 
-      // Close the waiting dialog if still open
-      if (mounted) Navigator.of(context, rootNavigator: true).maybePop();
+          // Close the waiting dialog if still open
+          if (mounted) Navigator.of(context, rootNavigator: true).maybePop();
 
-      if (status == 'accepted') {
-        if (!mounted) return;
-        setState(() {
-          _communityIds.add(contactId);
+          if (status == 'accepted') {
+            if (!mounted) return;
+            setState(() {
+              _communityIds.add(contactId);
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$contactName joined your community! ✓'),
+                backgroundColor: const Color(0xFF059669),
+              ),
+            );
+          } else {
+            // Declined
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$contactName declined the invite.'),
+                backgroundColor: const Color(0xFFDC2626),
+              ),
+            );
+          }
+
+          // Cleanup
+          final p = _pendingInvites.remove(contactId);
+          (p?['sub'] as StreamSubscription?)?.cancel();
+          if (mounted) setState(() {});
+
+          // Clean up Firebase node after a delay so the target also reads it
+          await Future.delayed(const Duration(seconds: 4));
+          await FirebaseService.clearCommunityInvite(contactId, inviteKey);
         });
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('$contactName joined your community! ✓'),
-          backgroundColor: const Color(0xFF059669),
-        ));
-      } else {
-        // Declined
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('$contactName declined the invite.'),
-          backgroundColor: const Color(0xFFDC2626),
-        ));
-      }
-
-      // Cleanup
-      final p = _pendingInvites.remove(contactId);
-      (p?['sub'] as StreamSubscription?)?.cancel();
-      if (mounted) setState(() {});
-
-      // Clean up Firebase node after a delay so the target also reads it
-      await Future.delayed(const Duration(seconds: 4));
-      await FirebaseService.clearCommunityInvite(contactId, inviteKey);
-    });
 
     if (mounted) {
       setState(() => _pendingInvites[contactId]!['sub'] = sub);
@@ -1132,7 +1368,8 @@ class _CommunityScreenState extends State<CommunityScreen>
         onWillPop: () async => false,
         child: Dialog(
           shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(24)),
+            borderRadius: BorderRadius.circular(24),
+          ),
           child: Container(
             padding: const EdgeInsets.all(28),
             decoration: BoxDecoration(
@@ -1152,23 +1389,24 @@ class _CommunityScreenState extends State<CommunityScreen>
                   child: CircularProgressIndicator(
                     strokeWidth: 3,
                     valueColor: AlwaysStoppedAnimation<Color>(
-                        Color(0xFF2DD4BF)),
+                      Color(0xFF2DD4BF),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 20),
                 const Text(
                   'Invite Sent',
                   style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold),
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
                 const SizedBox(height: 8),
                 Text(
                   'Waiting for $contactName\nto accept your community invite…',
                   textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: Colors.grey.shade400, fontSize: 13),
+                  style: TextStyle(color: Colors.grey.shade400, fontSize: 13),
                 ),
                 const SizedBox(height: 20),
                 OutlinedButton(
@@ -1180,16 +1418,18 @@ class _CommunityScreenState extends State<CommunityScreen>
                     final key = p?['inviteKey'] as String?;
                     if (key != null) {
                       await FirebaseService.clearCommunityInvite(
-                          contactId, key);
+                        contactId,
+                        key,
+                      );
                     }
                     if (mounted) setState(() {});
                   },
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white54,
-                    side:
-                        const BorderSide(color: Colors.white24),
+                    side: const BorderSide(color: Colors.white24),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10)),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
                   ),
                   child: const Text('Cancel Invite'),
                 ),
@@ -1200,6 +1440,7 @@ class _CommunityScreenState extends State<CommunityScreen>
       ),
     );
   }
+
   Widget _buildYouMarker() {
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1212,9 +1453,10 @@ class _CommunityScreenState extends State<CommunityScreen>
             shape: BoxShape.circle,
             boxShadow: [
               BoxShadow(
-                  color: const Color(0xFF2DD4BF).withOpacity(0.6),
-                  blurRadius: 14,
-                  spreadRadius: 2)
+                color: const Color(0xFF2DD4BF).withOpacity(0.6),
+                blurRadius: 14,
+                spreadRadius: 2,
+              ),
             ],
           ),
           child: const Center(
@@ -1228,11 +1470,14 @@ class _CommunityScreenState extends State<CommunityScreen>
             color: Colors.black.withOpacity(0.7),
             borderRadius: BorderRadius.circular(6),
           ),
-          child: const Text('YOU',
-              style: TextStyle(
-                  fontSize: 9,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF2DD4BF))),
+          child: const Text(
+            'YOU',
+            style: TextStyle(
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+              color: Color(0xFF2DD4BF),
+            ),
+          ),
         ),
       ],
     );
@@ -1273,48 +1518,53 @@ class _CommunityScreenState extends State<CommunityScreen>
                     ? const Color(0xFF059669)
                     : const Color(0xFFDC2626),
                 border: Border.all(
-                    color: isSelected
-                        ? Colors.white
-                        : (m.isInZone
+                  color: isSelected
+                      ? Colors.white
+                      : (m.isInZone
                             ? const Color(0xFF34D399)
                             : const Color(0xFFFCA5A5)),
-                    width: isSelected ? 3 : 1.5),
+                  width: isSelected ? 3 : 1.5,
+                ),
                 boxShadow: [
                   BoxShadow(
-                    color: (m.isInZone
-                            ? const Color(0xFF10B981)
-                            : const Color(0xFFEF4444))
-                        .withOpacity(0.5),
+                    color:
+                        (m.isInZone
+                                ? const Color(0xFF10B981)
+                                : const Color(0xFFEF4444))
+                            .withOpacity(0.5),
                     blurRadius: 10,
                     spreadRadius: 1,
-                  )
+                  ),
                 ],
               ),
               child: Center(
                 child: Text(
                   m.name.isNotEmpty ? m.name[0].toUpperCase() : '?',
                   style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14),
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
                 ),
               ),
             ),
             const SizedBox(height: 2),
             Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 4, vertical: 1.5),
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1.5),
               decoration: BoxDecoration(
                 color: m.isInZone
                     ? const Color(0xFF064E3B).withOpacity(0.9)
                     : const Color(0xFF7F1D1D).withOpacity(0.9),
                 borderRadius: BorderRadius.circular(6),
               ),
-              child: Text('${m.distance.toStringAsFixed(0)}m',
-                  style: const TextStyle(
-                      fontSize: 9,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white)),
+              child: Text(
+                '${m.distance.toStringAsFixed(0)}m',
+                style: const TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
             ),
           ],
         ),
@@ -1335,11 +1585,14 @@ class _CommunityScreenState extends State<CommunityScreen>
         children: [
           CircleAvatar(radius: 4, backgroundColor: Color(0xFF2DD4BF)),
           SizedBox(width: 5),
-          Text('≤ 50 m inside circle  |  > 50 m outside',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.w600)),
+          Text(
+            '≤ 50 m inside circle  |  > 50 m outside',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 9.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ],
       ),
     );
@@ -1355,9 +1608,7 @@ class _CommunityScreenState extends State<CommunityScreen>
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: isSelected
-              ? (m.isInZone
-                  ? const Color(0xFF2DD4BF)
-                  : const Color(0xFFF87171))
+              ? (m.isInZone ? const Color(0xFF2DD4BF) : const Color(0xFFF87171))
               : Colors.white.withOpacity(0.06),
           width: isSelected ? 1.5 : 1,
         ),
@@ -1374,7 +1625,9 @@ class _CommunityScreenState extends State<CommunityScreen>
               child: Text(
                 m.name.isNotEmpty ? m.name[0].toUpperCase() : '?',
                 style: const TextStyle(
-                    color: Colors.white, fontWeight: FontWeight.bold),
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
             const SizedBox(width: 12),
@@ -1382,17 +1635,22 @@ class _CommunityScreenState extends State<CommunityScreen>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(m.name,
-                      style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white)),
+                  Text(
+                    m.name,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
                   const SizedBox(height: 3),
                   Row(
                     children: [
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 5, vertical: 2),
+                          horizontal: 5,
+                          vertical: 2,
+                        ),
                         decoration: BoxDecoration(
                           color: m.isInZone
                               ? const Color(0xFF065F46)
@@ -1400,31 +1658,34 @@ class _CommunityScreenState extends State<CommunityScreen>
                           borderRadius: BorderRadius.circular(5),
                         ),
                         child: Text(
-                          m.isInZone
-                              ? 'IN ZONE'
-                              : 'OUT OF ZONE',
+                          m.isInZone ? 'IN ZONE' : 'OUT OF ZONE',
                           style: TextStyle(
-                              fontSize: 9,
-                              fontWeight: FontWeight.bold,
-                              color: m.isInZone
-                                  ? const Color(0xFF6EE7B7)
-                                  : const Color(0xFFFCA5A5)),
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold,
+                            color: m.isInZone
+                                ? const Color(0xFF6EE7B7)
+                                : const Color(0xFFFCA5A5),
+                          ),
                         ),
                       ),
                       const SizedBox(width: 6),
                       Text(
                         '${m.distance.toStringAsFixed(1)} m',
                         style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.grey.shade400,
-                            fontFamily: 'monospace'),
+                          fontSize: 11,
+                          color: Colors.grey.shade400,
+                          fontFamily: 'monospace',
+                        ),
                       ),
                       if (!m.hasLocation) ...[
                         const SizedBox(width: 6),
-                        Text('(No GPS)',
-                            style: TextStyle(
-                                fontSize: 10,
-                                color: Colors.orange.shade300)),
+                        Text(
+                          '(No GPS)',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Colors.orange.shade300,
+                          ),
+                        ),
                       ],
                     ],
                   ),
@@ -1435,24 +1696,26 @@ class _CommunityScreenState extends State<CommunityScreen>
             // Remove from community
             IconButton(
               tooltip: 'Remove from community',
-              icon: const Icon(Icons.remove_circle_outline_rounded,
-                  size: 20, color: Colors.red),
-              onPressed: () =>
-                  setState(() => _communityIds.remove(m.id)),
+              icon: const Icon(
+                Icons.remove_circle_outline_rounded,
+                size: 20,
+                color: Colors.red,
+              ),
+              onPressed: () => setState(() => _communityIds.remove(m.id)),
             ),
             // Track
             ElevatedButton.icon(
               onPressed: () => _trackPerson(m),
               icon: Icon(
-                m.isInZone
-                    ? Icons.navigation_rounded
-                    : Icons.search_rounded,
+                m.isInZone ? Icons.navigation_rounded : Icons.search_rounded,
                 size: 14,
               ),
               label: Text(
                 m.isInZone ? 'TRACK' : 'FIND',
                 style: const TextStyle(
-                    fontSize: 11, fontWeight: FontWeight.bold),
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: m.isInZone
@@ -1460,9 +1723,12 @@ class _CommunityScreenState extends State<CommunityScreen>
                     : const Color(0xFFDC2626),
                 foregroundColor: Colors.white,
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 10, vertical: 7),
+                  horizontal: 10,
+                  vertical: 7,
+                ),
                 shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(9)),
+                  borderRadius: BorderRadius.circular(9),
+                ),
                 elevation: 0,
               ),
             ),
@@ -1478,7 +1744,8 @@ class _CommunityScreenState extends State<CommunityScreen>
       context: context,
       backgroundColor: const Color(0xFF1E293B),
       shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
       builder: (_) => StatefulBuilder(
         builder: (ctx, setS) => Padding(
           padding: const EdgeInsets.all(20),
@@ -1486,29 +1753,34 @@ class _CommunityScreenState extends State<CommunityScreen>
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Simulate Movement',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 17,
-                      fontWeight: FontWeight.bold)),
+              const Text(
+                'Simulate Movement',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               const SizedBox(height: 6),
               Text(
                 'Move all members closer or further to test the 50 m boundary.',
-                style: TextStyle(
-                    color: Colors.grey.shade400, fontSize: 12),
+                style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
               ),
               const SizedBox(height: 18),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text('Distance offset',
-                      style: TextStyle(color: Colors.white)),
+                  const Text(
+                    'Distance offset',
+                    style: TextStyle(color: Colors.white),
+                  ),
                   Text(
                     '${_simOffset >= 0 ? "+" : ""}${_simOffset.toStringAsFixed(0)} m',
                     style: const TextStyle(
-                        color: Color(0xFF2DD4BF),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16),
+                      color: Color(0xFF2DD4BF),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
                   ),
                 ],
               ),
@@ -1534,8 +1806,9 @@ class _CommunityScreenState extends State<CommunityScreen>
                         setState(() => _simOffset = 0);
                       },
                       style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: const BorderSide(color: Colors.white24)),
+                        foregroundColor: Colors.white,
+                        side: const BorderSide(color: Colors.white24),
+                      ),
                       child: const Text('Reset'),
                     ),
                   ),
@@ -1547,8 +1820,10 @@ class _CommunityScreenState extends State<CommunityScreen>
                         backgroundColor: const Color(0xFF2DD4BF),
                         foregroundColor: const Color(0xFF0F172A),
                       ),
-                      child: const Text('Done',
-                          style: TextStyle(fontWeight: FontWeight.bold)),
+                      child: const Text(
+                        'Done',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ),
                   ),
                 ],
@@ -1576,24 +1851,25 @@ class RadarZonePainter extends CustomPainter {
     final zoneR = (size.width / 2) * 0.60;
 
     // Background
-    canvas.drawCircle(center, maxR,
-        Paint()..color = const Color(0xFF0B132B));
+    canvas.drawCircle(center, maxR, Paint()..color = const Color(0xFF0B132B));
 
     // Out-zone tint
     canvas.drawCircle(
-        center,
-        maxR,
-        Paint()
-          ..color = const Color(0xFFEF4444).withOpacity(0.06)
-          ..style = PaintingStyle.fill);
+      center,
+      maxR,
+      Paint()
+        ..color = const Color(0xFFEF4444).withOpacity(0.06)
+        ..style = PaintingStyle.fill,
+    );
 
     // Safe-zone fill
     canvas.drawCircle(
-        center,
-        zoneR,
-        Paint()
-          ..color = const Color(0xFF10B981).withOpacity(0.12)
-          ..style = PaintingStyle.fill);
+      center,
+      zoneR,
+      Paint()
+        ..color = const Color(0xFF10B981).withOpacity(0.12)
+        ..style = PaintingStyle.fill,
+    );
 
     // Grid rings
     final grid = Paint()
@@ -1608,26 +1884,34 @@ class RadarZonePainter extends CustomPainter {
     final cross = Paint()
       ..color = const Color(0xFF334155).withOpacity(0.5)
       ..strokeWidth = 0.8;
-    canvas.drawLine(Offset(center.dx, center.dy - maxR),
-        Offset(center.dx, center.dy + maxR), cross);
-    canvas.drawLine(Offset(center.dx - maxR, center.dy),
-        Offset(center.dx + maxR, center.dy), cross);
+    canvas.drawLine(
+      Offset(center.dx, center.dy - maxR),
+      Offset(center.dx, center.dy + maxR),
+      cross,
+    );
+    canvas.drawLine(
+      Offset(center.dx - maxR, center.dy),
+      Offset(center.dx + maxR, center.dy),
+      cross,
+    );
 
     // Zone perimeter
     canvas.drawCircle(
-        center,
-        zoneR,
-        Paint()
-          ..color = const Color(0xFF2DD4BF)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.5);
+      center,
+      zoneR,
+      Paint()
+        ..color = const Color(0xFF2DD4BF)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5,
+    );
     canvas.drawCircle(
-        center,
-        zoneR,
-        Paint()
-          ..color = const Color(0xFF2DD4BF).withOpacity(0.22)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 7);
+      center,
+      zoneR,
+      Paint()
+        ..color = const Color(0xFF2DD4BF).withOpacity(0.22)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 7,
+    );
 
     // Radar sweep
     canvas.save();
@@ -1644,7 +1928,7 @@ class RadarZonePainter extends CustomPainter {
           endAngle: pi / 2,
           colors: [
             Colors.transparent,
-            const Color(0xFF2DD4BF).withOpacity(0.28)
+            const Color(0xFF2DD4BF).withOpacity(0.28),
           ],
         ).createShader(Rect.fromCircle(center: Offset.zero, radius: maxR))
         ..style = PaintingStyle.fill,
@@ -1652,27 +1936,50 @@ class RadarZonePainter extends CustomPainter {
     canvas.restore();
 
     // Labels
-    _text(canvas, '50 m ZONE',
-        Offset(center.dx + 4, center.dy - zoneR + 4),
-        const Color(0xFF2DD4BF), 10, FontWeight.bold);
-    _text(canvas, '25 m',
-        Offset(center.dx + 4, center.dy - zoneR * 0.5 + 4),
-        Colors.white38, 9, FontWeight.normal);
-    _text(canvas, 'OUT >',
-        Offset(center.dx + 4, center.dy - maxR + 4),
-        const Color(0xFFF87171), 9, FontWeight.w600);
+    _text(
+      canvas,
+      '50 m ZONE',
+      Offset(center.dx + 4, center.dy - zoneR + 4),
+      const Color(0xFF2DD4BF),
+      10,
+      FontWeight.bold,
+    );
+    _text(
+      canvas,
+      '25 m',
+      Offset(center.dx + 4, center.dy - zoneR * 0.5 + 4),
+      Colors.white38,
+      9,
+      FontWeight.normal,
+    );
+    _text(
+      canvas,
+      'OUT >',
+      Offset(center.dx + 4, center.dy - maxR + 4),
+      const Color(0xFFF87171),
+      9,
+      FontWeight.w600,
+    );
   }
 
-  void _text(Canvas c, String text, Offset pos, Color color,
-      double size, FontWeight weight) {
+  void _text(
+    Canvas c,
+    String text,
+    Offset pos,
+    Color color,
+    double size,
+    FontWeight weight,
+  ) {
     final tp = TextPainter(
       text: TextSpan(
-          text: text,
-          style: TextStyle(
-              color: color,
-              fontSize: size,
-              fontWeight: weight,
-              fontFamily: 'monospace')),
+        text: text,
+        style: TextStyle(
+          color: color,
+          fontSize: size,
+          fontWeight: weight,
+          fontFamily: 'monospace',
+        ),
+      ),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(c, pos);
