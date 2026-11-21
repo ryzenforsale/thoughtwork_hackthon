@@ -104,19 +104,20 @@ class LocationService {
     controller = StreamController<Position>(
       onListen: () {
         // Primary: listen to the platform stream for instant movement updates.
-        geoSub = Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 0,
-          ),
-        ).listen(
-          (pos) {
-            if (!controller.isClosed) controller.add(pos);
-          },
-          onError: (e) {
-            print('⚠️ Raw stream error: $e');
-          },
-        );
+        geoSub =
+            Geolocator.getPositionStream(
+              locationSettings: const LocationSettings(
+                accuracy: LocationAccuracy.bestForNavigation,
+                distanceFilter: 0,
+              ),
+            ).listen(
+              (pos) {
+                if (!controller.isClosed) controller.add(pos);
+              },
+              onError: (e) {
+                print('⚠️ Raw stream error: $e');
+              },
+            );
 
         // Backup: poll every 3 seconds to guarantee freshness.
         timer = Timer.periodic(const Duration(seconds: 3), (_) async {

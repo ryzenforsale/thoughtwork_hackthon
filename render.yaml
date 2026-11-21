@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: meetme-voice
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: sk_944b8a9b768d180eda0862537e64c3983a7af76d7a175659
+        sync: false
+      - key: hpp4J3VqNfWAUOO0d1Us
+        sync: false
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_turbo_v2_5

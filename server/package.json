@@ -1,0 +1,16 @@
+{
+  "name": "meetme-voice",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ElevenLabs text-to-speech proxy for the MeetMe app (keeps the API key off the phone).",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

@@ -26,12 +26,15 @@ class FirebaseService {
     double lat,
     double lng, [
     double heading = 0.0,
+    double accuracy = 0.0,
   ]) async {
     await _db.child('devices/$deviceId').update({
       'lat': lat,
       'lng': lng,
       'heading': heading,
+      'accuracy': accuracy,
       'lastSeen': ServerValue.timestamp,
+      'locationUpdatedAt': ServerValue.timestamp,
     });
   }
 
@@ -101,12 +104,14 @@ class FirebaseService {
     String deviceId,
     double lat,
     double lng,
-    double heading,
-  ) async {
+    double heading, {
+    double? accuracy,
+  }) async {
     await _db.child('tracking_sessions/$sessionId/$deviceId').set({
       'lat': lat,
       'lng': lng,
       'heading': heading,
+      'accuracy': accuracy ?? 0.0,
       'timestamp': ServerValue.timestamp,
     });
   }
@@ -304,6 +309,7 @@ class FirebaseService {
     required double lat,
     required double lng,
     double heading = 0.0,
+    double accuracy = 0.0,
   }) async {
     await _db.child('community_members/$deviceId').set({
       'id': deviceId,
@@ -311,7 +317,9 @@ class FirebaseService {
       'lat': lat,
       'lng': lng,
       'heading': heading,
+      'accuracy': accuracy,
       'lastSeen': ServerValue.timestamp,
+      'locationUpdatedAt': ServerValue.timestamp,
     });
   }
 

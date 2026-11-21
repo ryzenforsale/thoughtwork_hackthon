@@ -12,8 +12,9 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController _nameController = TextEditingController();
-  final TextEditingController _communityController =
-      TextEditingController(text: 'Radar');
+  final TextEditingController _communityController = TextEditingController(
+    text: 'Radar',
+  );
   String? _deviceId;
   bool _isLoading = true;
   bool _isSubmitting = false;
@@ -39,9 +40,9 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _handleLogin() async {
     final name = _nameController.text.trim();
     if (name.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter your name')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Please enter your name')));
       return;
     }
 
@@ -68,9 +69,9 @@ class _LoginScreenState extends State<LoginScreen> {
       );
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to enter: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to enter: $e')));
       }
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
@@ -89,9 +90,7 @@ class _LoginScreenState extends State<LoginScreen> {
     if (_isLoading) {
       return const Scaffold(
         backgroundColor: Color(0xFFF7FBF9),
-        body: Center(
-          child: CircularProgressIndicator(color: Colors.teal),
-        ),
+        body: Center(child: CircularProgressIndicator(color: Colors.teal)),
       );
     }
 
@@ -202,26 +201,30 @@ class _LoginScreenState extends State<LoginScreen> {
                         controller: _nameController,
                         decoration: InputDecoration(
                           hintText: 'e.g. Rahul Sharma',
-                          prefixIcon: const Icon(Icons.person_outline,
-                              color: Colors.teal),
+                          prefixIcon: const Icon(
+                            Icons.person_outline,
+                            color: Colors.teal,
+                          ),
                           filled: true,
                           fillColor: const Color(0xFFF8FAFC),
                           contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 14),
+                            horizontal: 16,
+                            vertical: 14,
+                          ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                BorderSide(color: Colors.grey.shade300),
+                            borderSide: BorderSide(color: Colors.grey.shade300),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                BorderSide(color: Colors.grey.shade200),
+                            borderSide: BorderSide(color: Colors.grey.shade200),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
                             borderSide: const BorderSide(
-                                color: Colors.teal, width: 2),
+                              color: Colors.teal,
+                              width: 2,
+                            ),
                           ),
                         ),
                       ),
@@ -241,26 +244,30 @@ class _LoginScreenState extends State<LoginScreen> {
                         controller: _communityController,
                         decoration: InputDecoration(
                           hintText: 'e.g. Radar',
-                          prefixIcon: const Icon(Icons.location_city_outlined,
-                              color: Colors.teal),
+                          prefixIcon: const Icon(
+                            Icons.location_city_outlined,
+                            color: Colors.teal,
+                          ),
                           filled: true,
                           fillColor: const Color(0xFFF8FAFC),
                           contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 14),
+                            horizontal: 16,
+                            vertical: 14,
+                          ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                BorderSide(color: Colors.grey.shade300),
+                            borderSide: BorderSide(color: Colors.grey.shade300),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
-                            borderSide:
-                                BorderSide(color: Colors.grey.shade200),
+                            borderSide: BorderSide(color: Colors.grey.shade200),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
                             borderSide: const BorderSide(
-                                color: Colors.teal, width: 2),
+                              color: Colors.teal,
+                              width: 2,
+                            ),
                           ),
                         ),
                       ),
@@ -269,15 +276,20 @@ class _LoginScreenState extends State<LoginScreen> {
                       // Device Hardware Tag
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 8),
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
                         decoration: BoxDecoration(
                           color: Colors.teal.shade50.withOpacity(0.6),
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: Row(
                           children: [
-                            const Icon(Icons.fingerprint,
-                                size: 16, color: Colors.teal),
+                            const Icon(
+                              Icons.fingerprint,
+                              size: 16,
+                              color: Colors.teal,
+                            ),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Text(
@@ -343,8 +355,11 @@ class _LoginScreenState extends State<LoginScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.verified_user_outlined,
-                        size: 14, color: Colors.grey.shade500),
+                    Icon(
+                      Icons.verified_user_outlined,
+                      size: 14,
+                      color: Colors.grey.shade500,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       'Live zone geofencing & BLE active',

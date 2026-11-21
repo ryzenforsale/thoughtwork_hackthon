@@ -23,11 +23,7 @@ class StabilityIndicator extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            _getIcon(),
-            color: _getColor(),
-            size: 16,
-          ),
+          Icon(_getIcon(), color: _getColor(), size: 16),
           const SizedBox(width: 8),
           Text(
             _getText(),
@@ -40,10 +36,7 @@ class StabilityIndicator extends StatelessWidget {
           const SizedBox(width: 8),
           Text(
             '$stabilityPercent%',
-            style: TextStyle(
-              color: _getColor(),
-              fontSize: 12,
-            ),
+            style: TextStyle(color: _getColor(), fontSize: 12),
           ),
         ],
       ),
@@ -73,10 +66,8 @@ class StabilityIndicator extends StatelessWidget {
 class StabilityBar extends StatelessWidget {
   final int stabilityPercent;
 
-  const StabilityBar({
-    Key? key,
-    required this.stabilityPercent,
-  }) : super(key: key);
+  const StabilityBar({Key? key, required this.stabilityPercent})
+    : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -88,10 +79,7 @@ class StabilityBar extends StatelessWidget {
           children: [
             Text(
               'Signal Stability',
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.grey[600],
-              ),
+              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
             ),
             Text(
               '$stabilityPercent%',
@@ -152,7 +140,7 @@ class DistanceDisplay extends StatelessWidget {
             color: isStable ? Colors.black : Colors.orange,
           ),
         ),
-        
+
         // Raw vs filtered indicator
         if (rawDistance != null && (rawDistance! - distance).abs() > 1)
           Text(
@@ -163,7 +151,7 @@ class DistanceDisplay extends StatelessWidget {
               fontStyle: FontStyle.italic,
             ),
           ),
-        
+
         // Unstable warning
         if (!isStable)
           Container(

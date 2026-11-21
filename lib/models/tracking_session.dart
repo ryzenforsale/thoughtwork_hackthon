@@ -3,20 +3,27 @@ class LocationData {
   final double lng;
   final double heading;
   final int timestamp;
+  final double accuracy;
 
   LocationData({
     required this.lat,
     required this.lng,
     required this.heading,
     required this.timestamp,
+    this.accuracy = 0,
   });
 
   factory LocationData.fromMap(Map<dynamic, dynamic> map) {
     return LocationData(
-      lat: (map['lat'] ?? 0).toDouble(),
-      lng: (map['lng'] ?? 0).toDouble(),
-      heading: (map['heading'] ?? 0).toDouble(),
-      timestamp: map['timestamp'] ?? 0,
+      lat: _asDouble(map['lat']),
+      lng: _asDouble(map['lng']),
+      heading: _asDouble(map['heading']),
+      // Sessions use `timestamp`, devices/community use `locationUpdatedAt`
+      // (falling back to `lastSeen` for older clients).
+      timestamp: _asInt(
+        map['timestamp'] ?? map['locationUpdatedAt'] ?? map['lastSeen'],
+      ),
+      accuracy: _asDouble(map['accuracy']),
     );
   }
 
@@ -26,7 +33,20 @@ class LocationData {
       'lng': lng,
       'heading': heading,
       'timestamp': timestamp,
+      'accuracy': accuracy,
     };
+  }
+
+  static double _asDouble(dynamic value) {
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? 0;
+    return 0;
+  }
+
+  static int _asInt(dynamic value) {
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value) ?? 0;
+    return 0;
   }
 }
 

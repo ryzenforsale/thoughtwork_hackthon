@@ -1,12 +1,19 @@
-import 'package:flutter/material.dart';
-import 'package:flutter_compass/flutter_compass.dart';
-import 'package:geolocator/geolocator.dart';
 import 'dart:async';
-import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../services/arrow_engine.dart';
+import '../services/bluetooth_distance_service.dart';
+import '../services/compass_service.dart';
+import '../services/distance_engine.dart';
 import '../services/firebase_service.dart';
 import '../services/location_service.dart';
-import '../services/bluetooth_distance_service.dart';
-import '../models/tracking_session.dart';
+import '../services/position_service.dart';
+import '../services/voice_guide_service.dart';
+import '../services/voice_phrase.dart';
+import '../widgets/rotating_arrow.dart';
+import 'map_screen.dart';
 
 class TrackingScreenA extends StatefulWidget {
   final String sessionId;
@@ -26,535 +33,539 @@ class TrackingScreenA extends StatefulWidget {
   State<TrackingScreenA> createState() => _TrackingScreenAState();
 }
 
-class _TrackingScreenAState extends State<TrackingScreenA>
-    with TickerProviderStateMixin {
-  StreamSubscription<Position>? _locationSubscription;
-  StreamSubscription<CompassEvent>? _compassSubscription;
-  StreamSubscription<LocationData?>? _friendLocationSubscription;
-  StreamSubscription<LocationData?>? _friendCommunityLocationSubscription;
-  StreamSubscription<LocationData?>? _friendSessionLocationSubscription;
-  StreamSubscription<Position>? _distanceLocationSubscription;
-  Timer? _locationPollTimer;
+class _TrackingScreenAState extends State<TrackingScreenA> {
+  final ValueNotifier<double> _arrowAngle = ValueNotifier<double>(0);
+  final AngleTracker _angleTracker = AngleTracker();
+  final CircularFilter _bearingFilter = CircularFilter();
+  final VoiceGuideService _voice = VoiceGuideService();
 
-  double? myLat;
-  double? myLng;
-  double? _distanceMyLat;
-  double? _distanceMyLng;
-  double myHeading = 0;
+  DistanceReading? _distance;
+  ArrowMode _mode = ArrowMode.waiting;
+  double _uncertaintyDeg = 90;
+  int? _friendAgeSeconds;
+  bool _needsCalibration = false;
+  bool _permissionDenied = false;
+  bool _voiceEnabled = true;
 
-  double? friendLat;
-  double? friendLng;
-  double? bleDistance;
-  DateTime? _bleDistanceUpdatedAt;
-  StreamSubscription? _bleSubscription;
-  Timer? _distanceRefreshTimer;
+  StreamSubscription<Map<String, dynamic>>? _bleSubscription;
+  double? _bleDistance;
+  DateTime? _bleUpdatedAt;
 
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnimation;
-
-  double _previousArrowRotation = 0;
-  double _currentArrowRotation = 0;
-  late AnimationController _arrowController;
-  late Animation<double> _arrowAnimation;
-
-  static const double _headingSmoothingFactor = 0.15;
-  double _smoothedHeading = 0;
-
-  DateTime _lastFirebaseUpdate = DateTime.now();
-  static const Duration _minUpdateInterval = Duration(seconds: 1);
+  Timer? _ticker;
+  DateTime? _lastBearingSampleAt;
+  DateTime _lastFirebaseUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
     super.initState();
-    _setupAnimations();
-    _distanceRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
+    SystemChrome.setPreferredOrientations(const [DeviceOrientation.portraitUp]);
     _startTracking();
   }
 
-  void _setupAnimations() {
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1500),
-    )..repeat(reverse: true);
-
-    _pulseAnimation = Tween<double>(begin: 140, end: 180).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
-
-    _arrowController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 500),
-    );
-    _arrowAnimation = Tween<double>(
-      begin: 0,
-      end: 0,
-    ).animate(CurvedAnimation(parent: _arrowController, curve: Curves.easeOut));
-  }
-
-  void _onCompassEvent(CompassEvent event) {
-    if (event.heading == null) return;
-
-    double newHeading = event.heading!;
-
-    double diff = newHeading - _smoothedHeading;
-    if (diff > 180) diff -= 360;
-    if (diff < -180) diff += 360;
-
-    _smoothedHeading =
-        (_smoothedHeading + _headingSmoothingFactor * diff) % 360;
-    if (_smoothedHeading < 0) _smoothedHeading += 360;
-
-    setState(() {
-      myHeading = _smoothedHeading;
-    });
-    _updateArrowRotation();
-
-    // Also push heading to Firebase if we have a position
-    if (myLat != null && myLng != null) {
-      final now = DateTime.now();
-      if (now.difference(_lastFirebaseUpdate) > _minUpdateInterval) {
-        _lastFirebaseUpdate = now;
-        FirebaseService.updateLocation(
-          widget.sessionId,
-          widget.myDeviceId,
-          myLat!,
-          myLng!,
-          myHeading,
-        );
-      }
-    }
-  }
-
-  void _updateArrowRotation() {
-    final bearing = _calculateBearing();
-    if (bearing == null) return;
-
-    double newRotation = (bearing - myHeading) % 360;
-    if (newRotation > 180) newRotation -= 360;
-    if (newRotation < -180) newRotation += 360;
-
-    _previousArrowRotation = _currentArrowRotation;
-    _currentArrowRotation = newRotation;
-
-    double diff = _currentArrowRotation - _previousArrowRotation;
-    if (diff > 180) diff -= 360;
-    if (diff < -180) diff += 360;
-
-    _arrowAnimation = Tween<double>(
-      begin: _previousArrowRotation,
-      end: _previousArrowRotation + diff,
-    ).animate(CurvedAnimation(parent: _arrowController, curve: Curves.easeOut));
-
-    _arrowController.forward(from: 0);
-  }
-
   Future<void> _startTracking() async {
-    LocationService.resetFilter(); // ✅ Fresh filter for new session
-    // 1. Request location permission
     final hasPermission = await LocationService.requestPermission();
     if (!hasPermission) {
-      if (mounted) _showError('Location permission denied');
+      if (mounted) setState(() => _permissionDenied = true);
       return;
     }
 
-    // 2. Start location updates (My Location)
-    _locationSubscription = LocationService.getPositionStream().listen(
-      (position) {
-        if (!mounted) return;
-        setState(() {
-          myLat = position.latitude;
-          myLng = position.longitude;
-        });
-        _updateArrowRotation();
+    LocationService.resetFilter();
+    await MyPositionService.start();
+    await CompassService.start();
+    FriendPositionService.watch(widget.sessionId, widget.friendId);
 
-        // Send my location to Firebase with throttling
-        final now = DateTime.now();
-        if (now.difference(_lastFirebaseUpdate) > _minUpdateInterval) {
-          _lastFirebaseUpdate = now;
-          FirebaseService.updateLocation(
-            widget.sessionId,
-            widget.myDeviceId,
-            position.latitude,
-            position.longitude,
-            myHeading,
-          );
-        }
-      },
-      onError: (e) {
-        print("🔴 [TRACKING_A] Location Error: $e");
-      },
-    );
+    MyPositionService.fix.addListener(_onMyFix);
+    FriendPositionService.fix.addListener(_onFriendFix);
+    CompassService.heading.addListener(_onHeading);
 
-    // Keep distance responsive without changing the filtered arrow position.
-    _distanceLocationSubscription = LocationService.getRawPositionStream()
-        .listen(
-          (position) {
-            if (!mounted) return;
-            setState(() {
-              _distanceMyLat = position.latitude;
-              _distanceMyLng = position.longitude;
-            });
-          },
-          onError: (e) {
-            print("🔴 [TRACKING_A] Raw Location Error: $e");
-          },
-        );
+    // Advertise too, so the other phone can use BLE proximity as well.
+    unawaited(BluetoothDistanceService.startAdvertising(widget.myDeviceId));
 
-    // ✅ SAFETY NET: poll getCurrentPosition every 3 seconds so distance
-    // always updates even if both streams stall or die.
-    _locationPollTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
-      if (!mounted) return;
-      try {
-        final pos = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.bestForNavigation,
-          timeLimit: const Duration(seconds: 5),
-        );
-        if (!mounted) return;
-        setState(() {
-          _distanceMyLat = pos.latitude;
-          _distanceMyLng = pos.longitude;
-          // Also update main coords so Firebase stays fresh
-          myLat = pos.latitude;
-          myLng = pos.longitude;
-        });
-        // Push to Firebase
-        final now = DateTime.now();
-        if (now.difference(_lastFirebaseUpdate) > _minUpdateInterval) {
-          _lastFirebaseUpdate = now;
-          FirebaseService.updateLocation(
-            widget.sessionId,
-            widget.myDeviceId,
-            pos.latitude,
-            pos.longitude,
-            myHeading,
-          );
-        }
-      } catch (_) {}
-    });
+    // Prime the local TTS + the Render/ElevenLabs proxy before the first
+    // direction so the demo does not wait on a cold start.
+    unawaited(_voice.warmUp());
 
-    // 3. Start compass updates
-    try {
-      _compassSubscription = FlutterCompass.events?.listen((event) {
-        if (!mounted) return;
-        _onCompassEvent(event);
-      });
-    } catch (e) {
-      print("⚠️ [TRACKING_A] Compass not available: $e");
-    }
-
-    // 4a. Listen to friend's DEVICE location (community mode — friend broadcasts to devices/)
-    _friendLocationSubscription =
-        FirebaseService.listenToDeviceLocation(widget.friendId).listen(
-          (locationData) {
-            if (!mounted) return;
-            if (locationData != null) {
-              setState(() {
-                friendLat = locationData.lat;
-                friendLng = locationData.lng;
-              });
-              _updateArrowRotation();
-            }
-          },
-          onError: (e) {
-            print("🔴 [TRACKING_A] Firebase Device Location Error: $e");
-          },
-        );
-
-    // Community participants publish their position under community_members/.
-    _friendCommunityLocationSubscription =
-        FirebaseService.listenToCommunityMemberLocation(widget.friendId).listen(
-          (locationData) {
-            if (!mounted) return;
-            if (locationData != null) {
-              setState(() {
-                friendLat = locationData.lat;
-                friendLng = locationData.lng;
-              });
-              _updateArrowRotation();
-            }
-          },
-          onError: (e) {
-            print("🔴 [TRACKING_A] Firebase Community Location Error: $e");
-          },
-        );
-
-    // 4b. Also listen to friend's SESSION location (individual mode — friend writes to tracking_sessions/)
-    _friendSessionLocationSubscription =
-        FirebaseService.listenToLocation(
-          widget.sessionId,
-          widget.friendId,
-        ).listen(
-          (locationData) {
-            if (!mounted) return;
-            if (locationData != null) {
-              setState(() {
-                friendLat = locationData.lat;
-                friendLng = locationData.lng;
-              });
-              _updateArrowRotation();
-            }
-          },
-          onError: (e) {
-            print("🔴 [TRACKING_A] Firebase Session Location Error: $e");
-          },
-        );
-
-    // 5. Start BLE scanning for distance blending
     _bleSubscription = BluetoothDistanceService.scanForDevice(widget.friendId)
         .listen((result) {
-          if (mounted && result['distance'] != null && result['distance'] > 0) {
-            setState(() {
-              bleDistance = result['distance'];
-              _bleDistanceUpdatedAt = DateTime.now();
-            });
+          final value = result['distance'];
+          if (value is num && value > 0) {
+            _bleDistance = value.toDouble();
+            _bleUpdatedAt = DateTime.now();
+            _refresh();
           }
         });
+
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) => _refresh());
+    _refresh();
   }
 
-  double? _calculateDistance() {
-    double? gpsDistance;
-    if (_distanceMyLat != null &&
-        _distanceMyLng != null &&
-        friendLat != null &&
-        friendLng != null) {
-      gpsDistance = LocationService.calculateDistance(
-        _distanceMyLat!,
-        _distanceMyLng!,
-        friendLat!,
-        friendLng!,
+  void _onMyFix() {
+    _publishMyLocation();
+    _refresh();
+  }
+
+  void _onFriendFix() {
+    _refresh();
+  }
+
+  /// Runs at compass rate (~30 Hz) and only touches the arrow notifier, so the
+  /// rest of the screen is not rebuilt.
+  void _onHeading() {
+    final heading = CompassService.heading.value;
+    final bearing = _bearingFilter.value;
+    if (heading == null || bearing == null) return;
+
+    final target = CompassService.isAvailable
+        ? ArrowEngine.relativeBearing(bearing, heading.degrees)
+        : bearing;
+
+    final next = _angleTracker.update(target, deadbandDegrees: 3);
+    if (next != null) _arrowAngle.value = next;
+  }
+
+  void _refresh() {
+    if (!mounted) return;
+
+    final my = MyPositionService.fix.value;
+    final friend = FriendPositionService.fix.value;
+    final heading = CompassService.heading.value;
+    final compassAvailable = CompassService.isAvailable && heading != null;
+
+    final reading = DistanceEngine.evaluate(
+      myLat: my?.lat,
+      myLng: my?.lng,
+      myAccuracyMeters: my?.accuracyMeters,
+      friendLat: friend?.lat,
+      friendLng: friend?.lng,
+      friendAccuracyMeters: friend?.accuracyMeters,
+      bleDistanceMeters: _bleDistance,
+      bleAgeSeconds: _bleUpdatedAt == null
+          ? null
+          : DateTime.now().difference(_bleUpdatedAt!).inMilliseconds / 1000.0,
+    );
+
+    ArrowMode mode;
+    double? rawBearing;
+
+    if (my == null || friend == null || friend.isDead) {
+      mode = ArrowMode.waiting;
+    } else {
+      rawBearing = ArrowEngine.bearingDegrees(
+        my.lat,
+        my.lng,
+        friend.lat,
+        friend.lng,
       );
-    }
 
-    final bleIsFresh =
-        _bleDistanceUpdatedAt != null &&
-        DateTime.now().difference(_bleDistanceUpdatedAt!) <
-            const Duration(seconds: 3);
-
-    if (bleIsFresh &&
-        bleDistance != null &&
-        bleDistance! > 0 &&
-        gpsDistance != null &&
-        gpsDistance > 0) {
-      if (gpsDistance < 10) {
-        return bleDistance; // Trust BLE fully at close range
-      } else if (gpsDistance < 50) {
-        // Transition zone: blend
-        double bleWeight = (50 - gpsDistance) / 40;
-        return bleDistance! * bleWeight + gpsDistance * (1 - bleWeight);
+      if (friend.isStale) {
+        mode = ArrowMode.stale;
       } else {
-        return gpsDistance; // Trust GPS fully at far range
+        _smoothBearing(my, friend, rawBearing);
+
+        if (reading.isVeryClose) {
+          mode = ArrowMode.veryClose;
+        } else if (!compassAvailable) {
+          mode = ArrowMode.northUp;
+        } else {
+          mode = ArrowMode.normal;
+        }
       }
     }
 
-    return gpsDistance ?? (bleIsFresh ? bleDistance : null);
-  }
+    final smoothedBearing = _bearingFilter.value ?? rawBearing;
+    final headingDegrees = heading?.degrees;
+    final relativeBearing =
+        (smoothedBearing != null && compassAvailable && headingDegrees != null)
+        ? ArrowEngine.relativeBearing(smoothedBearing, headingDegrees)
+        : null;
 
-  double? _calculateBearing() {
-    if (myLat == null ||
-        myLng == null ||
-        friendLat == null ||
-        friendLng == null)
-      return null;
-    return LocationService.calculateBearing(
-      myLat!,
-      myLng!,
-      friendLat!,
-      friendLng!,
+    if (smoothedBearing != null) {
+      final target = relativeBearing ?? smoothedBearing;
+      final next = _angleTracker.update(target, deadbandDegrees: 4);
+      if (next != null) _arrowAngle.value = next;
+    }
+
+    final uncertainty = (my != null && friend != null && reading.meters != null)
+        ? ArrowEngine.bearingUncertaintyDegrees(
+            distanceMeters: reading.meters!,
+            myAccuracyMeters: my.accuracyMeters,
+            friendAccuracyMeters: friend.accuracyMeters,
+            headingAccuracyDegrees: heading?.accuracyDegrees ?? 20,
+          )
+        : 90.0;
+
+    final age = friend == null
+        ? null
+        : DateTime.now().difference(friend.at).inSeconds;
+
+    setState(() {
+      _distance = reading;
+      _mode = mode;
+      _uncertaintyDeg = uncertainty;
+      _friendAgeSeconds = age;
+      _needsCalibration = compassAvailable && CompassService.needsCalibration;
+    });
+
+    unawaited(
+      _voice.update(
+        VoiceContext(
+          friendName: widget.friendName,
+          distanceMeters: reading.meters,
+          relativeBearingDegrees: mode == ArrowMode.normal
+              ? relativeBearing
+              : null,
+          absoluteBearingDegrees: smoothedBearing,
+          isVeryClose: mode == ArrowMode.veryClose,
+          isStale: mode == ArrowMode.stale,
+          friendAgeSeconds: age,
+        ),
+      ),
     );
   }
 
-  double _calculateArrowRotation() {
-    return _currentArrowRotation;
+  void _smoothBearing(PositionFix my, PositionFix friend, double rawBearing) {
+    final lastSample = _lastBearingSampleAt;
+    final isNewSample =
+        lastSample == null || !friend.at.isAtSameMomentAs(lastSample);
+    if (!isNewSample && _bearingFilter.hasValue) return;
+
+    _lastBearingSampleAt = friend.at;
+    final distance = DistanceEngine.haversineMeters(
+      my.lat,
+      my.lng,
+      friend.lat,
+      friend.lng,
+    );
+    _bearingFilter.add(rawBearing, _bearingAlpha(distance));
   }
 
-  String _getDirectionText() {
-    final bearing = _calculateBearing();
-    if (bearing == null) return 'Searching...';
+  /// More smoothing close up (where GPS bearing is noisy) and less smoothing
+  /// far away (where it is reliable and lag would be noticeable).
+  double _bearingAlpha(double distanceMeters) {
+    if (distanceMeters < 15) return 0.30;
+    if (distanceMeters < 40) return 0.40;
+    if (distanceMeters < 100) return 0.50;
+    return 0.60;
+  }
 
-    // Calculate relative bearing
-    double relativeBearing = (bearing - myHeading + 360) % 360;
-    return LocationService.getDirectionText(relativeBearing);
+  void _publishMyLocation() {
+    final my = MyPositionService.fix.value;
+    if (my == null) return;
+
+    final now = DateTime.now();
+    if (now.difference(_lastFirebaseUpdate) <
+        const Duration(milliseconds: 900)) {
+      return;
+    }
+    _lastFirebaseUpdate = now;
+
+    final heading = CompassService.heading.value?.degrees ?? 0.0;
+    unawaited(
+      FirebaseService.updateLocation(
+        widget.sessionId,
+        widget.myDeviceId,
+        my.lat,
+        my.lng,
+        heading,
+        accuracy: my.accuracyMeters,
+      ),
+    );
+    unawaited(
+      FirebaseService.updateDeviceLocation(
+        widget.myDeviceId,
+        my.lat,
+        my.lng,
+        heading,
+        my.accuracyMeters,
+      ),
+    );
+  }
+
+  String _directionText() {
+    switch (_mode) {
+      case ArrowMode.waiting:
+        return '';
+      case ArrowMode.stale:
+        return _friendAgeSeconds == null
+            ? 'Last known position'
+            : 'Last seen ${_friendAgeSeconds}s ago';
+      case ArrowMode.northUp:
+        final bearing = _bearingFilter.value;
+        return bearing == null
+            ? 'North-up'
+            : 'North-up · ${DistanceEngine.compassSector(bearing)}';
+      case ArrowMode.veryClose:
+        return 'Look around — they are very close';
+      case ArrowMode.normal:
+        if (_uncertaintyDeg > 35) return 'Turn slowly…';
+        return LocationService.getDirectionText(
+          ArrowEngine.normalize360(_angleTracker.shown),
+        );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final distance = _calculateDistance();
-    final arrowRotation = _calculateArrowRotation();
+    final reading = _distance;
+    final showArrow =
+        _mode != ArrowMode.waiting && reading != null && reading.meters != null;
 
     return Scaffold(
       body: Container(
-        decoration: BoxDecoration(
+        decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [const Color(0xFF00D4AA), const Color(0xFF00A896)],
+            colors: [Color(0xFF00D4AA), Color(0xFF00A896)],
           ),
         ),
         child: SafeArea(
           child: Column(
             children: [
-              // Header
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      onPressed: _stopTracking,
-                    ),
-                    Expanded(
-                      child: Text(
-                        widget.friendName,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 48),
-                  ],
-                ),
-              ),
-
-              // Main content
+              _buildHeader(),
               Expanded(
                 child: Center(
-                  child: distance == null || friendLat == null
-                      ? Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: const [
-                            CircularProgressIndicator(
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                Colors.white,
-                              ),
-                            ),
-                            SizedBox(height: 24),
-                            Text(
-                              'Finding friend\'s location...',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                              ),
-                            ),
-                          ],
-                        )
-                      : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            // ✅ NEW: Bigger, more realistic arrow with pulsing circles
-                            Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                // Outer pulse (largest)
-                                AnimatedBuilder(
-                                  animation: _pulseAnimation,
-                                  builder: (context, child) {
-                                    return Container(
-                                      width: _pulseAnimation.value + 60,
-                                      height: _pulseAnimation.value + 60,
-                                      decoration: BoxDecoration(
-                                        shape: BoxShape.circle,
-                                        color: Colors.white.withOpacity(0.08),
-                                      ),
-                                    );
-                                  },
-                                ),
-                                // Middle pulse
-                                AnimatedBuilder(
-                                  animation: _pulseAnimation,
-                                  builder: (context, child) {
-                                    return Container(
-                                      width: _pulseAnimation.value + 30,
-                                      height: _pulseAnimation.value + 30,
-                                      decoration: BoxDecoration(
-                                        shape: BoxShape.circle,
-                                        color: Colors.white.withOpacity(0.15),
-                                      ),
-                                    );
-                                  },
-                                ),
-                                // Inner circle (background)
-                                Container(
-                                  width: 140,
-                                  height: 140,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: Colors.white.withOpacity(0.25),
-                                  ),
-                                ),
-                                // ✅ CUSTOM REALISTIC ARROW
-                                AnimatedBuilder(
-                                  animation: _arrowAnimation,
-                                  builder: (context, child) {
-                                    return Transform.rotate(
-                                      angle: _arrowAnimation.value * pi / 180,
-                                      child: CustomPaint(
-                                        size: const Size(140, 140),
-                                        painter: RealisticArrowPainter(),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              ],
-                            ),
-
-                            const SizedBox(height: 60),
-
-                            // Distance
-                            Text(
-                              LocationService.formatDistance(distance),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 56,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-
-                            const SizedBox(height: 8),
-
-                            // Direction
-                            Text(
-                              _getDirectionText(),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 24,
-                              ),
-                            ),
-                          ],
-                        ),
+                  child: showArrow
+                      ? _buildTrackingView(reading)
+                      : _buildWaitingView(),
                 ),
               ),
-
-              // Stop button
-              Padding(
-                padding: const EdgeInsets.all(32),
-                child: ElevatedButton(
-                  onPressed: _stopTracking,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 48,
-                      vertical: 16,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(30),
-                    ),
-                    elevation: 5,
-                  ),
-                  child: const Text(
-                    'Stop Tracking',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ),
+              _buildStopButton(),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.arrow_back, color: Colors.white),
+            onPressed: _stopTracking,
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.white.withValues(alpha: 0.18),
+              shape: const CircleBorder(),
+              fixedSize: const Size(44, 44),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              widget.friendName,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          _buildVoiceButton(),
+          const SizedBox(width: 8),
+          _buildMapButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildVoiceButton() {
+    return Material(
+      color: _voiceEnabled
+          ? Colors.white.withValues(alpha: 0.18)
+          : Colors.black.withValues(alpha: 0.18),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: _toggleVoice,
+        child: Tooltip(
+          message: _voiceEnabled
+              ? 'Mute voice guidance'
+              : 'Unmute voice guidance',
+          child: SizedBox(
+            width: 44,
+            height: 44,
+            child: Icon(
+              _voiceEnabled ? Icons.volume_up : Icons.volume_off,
+              color: Colors.white,
+              size: 22,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _toggleVoice() {
+    final next = !_voiceEnabled;
+    setState(() => _voiceEnabled = next);
+    _voice.enabled = next;
+    if (next) {
+      unawaited(_voice.warmUp());
+    }
+  }
+
+  Widget _buildMapButton() {
+    return Material(
+      color: Colors.white.withValues(alpha: 0.18),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: _openMap,
+        child: const Tooltip(
+          message: 'Open live map',
+          child: SizedBox(
+            width: 44,
+            height: 44,
+            child: Icon(Icons.map_outlined, color: Colors.white, size: 22),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openMap() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MapScreen(friendName: widget.friendName),
+      ),
+    );
+  }
+
+  Widget _buildWaitingView() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+          ),
+          const SizedBox(height: 24),
+          Text(
+            _permissionDenied
+                ? 'Location permission denied'
+                : "Finding ${widget.friendName}'s location...",
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white, fontSize: 18),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTrackingView(DistanceReading reading) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        ArrowDisplay(
+          angle: _arrowAngle,
+          uncertaintyDeg: _uncertaintyDeg,
+          mode: _mode,
+          friendName: widget.friendName,
+          friendAgeSeconds: _friendAgeSeconds,
+        ),
+        const SizedBox(height: 36),
+        Text(
+          reading.displayValue,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: reading.isVeryClose ? 42 : 56,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        const SizedBox(height: 10),
+        _buildSourceChip(reading),
+        const SizedBox(height: 12),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: Text(
+            _directionText(),
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white, fontSize: 22),
+          ),
+        ),
+        if (_needsCalibration) ...[
+          const SizedBox(height: 18),
+          _buildCalibrationHint(),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildSourceChip(DistanceReading reading) {
+    final icon = reading.source == DistanceSource.bluetooth
+        ? Icons.bluetooth
+        : Icons.gps_fixed;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: Colors.white70),
+          const SizedBox(width: 6),
+          Text(
+            reading.detail,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCalibrationHint() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 28),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: const [
+          Icon(Icons.explore_off_outlined, size: 15, color: Colors.white70),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Compass accuracy is low — move your phone in a figure-8.',
+              style: TextStyle(color: Colors.white70, fontSize: 11.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStopButton() {
+    return Padding(
+      padding: const EdgeInsets.all(32),
+      child: ElevatedButton(
+        onPressed: _stopTracking,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.red,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(30),
+          ),
+          elevation: 5,
+        ),
+        child: const Text(
+          'Stop Tracking',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
       ),
     );
@@ -587,114 +598,21 @@ class _TrackingScreenAState extends State<TrackingScreenA>
     }
   }
 
-  void _showError(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), backgroundColor: Colors.red),
-    );
-  }
-
   @override
   void dispose() {
-    _locationSubscription?.cancel();
-    _distanceLocationSubscription?.cancel();
-    _locationPollTimer?.cancel();
-    _compassSubscription?.cancel();
-    _friendLocationSubscription?.cancel();
-    _friendCommunityLocationSubscription?.cancel();
-    _friendSessionLocationSubscription?.cancel();
+    _ticker?.cancel();
     _bleSubscription?.cancel();
-    _distanceRefreshTimer?.cancel();
-    _pulseController.dispose();
-    _arrowController.dispose();
+    MyPositionService.fix.removeListener(_onMyFix);
+    FriendPositionService.fix.removeListener(_onFriendFix);
+    CompassService.heading.removeListener(_onHeading);
+    FriendPositionService.stop();
+    MyPositionService.stop();
+    CompassService.stop();
+    _voice.dispose();
+    unawaited(BluetoothDistanceService.stopScanning());
+    unawaited(BluetoothDistanceService.stopAdvertising());
+    _arrowAngle.dispose();
+    SystemChrome.setPreferredOrientations(const []);
     super.dispose();
   }
-}
-
-// ✅ NEW: Custom realistic arrow painter
-class RealisticArrowPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.white
-      ..style = PaintingStyle.fill;
-
-    final strokePaint = Paint()
-      ..color = Colors.white.withOpacity(0.3)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3;
-
-    final center = Offset(size.width / 2, size.height / 2);
-
-    // Arrow dimensions
-    final arrowLength = size.height * 0.55; // 55% of container
-    final arrowWidth = size.width * 0.25; // 25% of container
-    final headLength = arrowLength * 0.4; // Arrow head is 40% of total length
-    final tailWidth = arrowWidth * 0.35; // Tail is 35% of arrow width
-
-    final path = Path();
-
-    // Start from top center (arrow tip)
-    path.moveTo(center.dx, center.dy - arrowLength / 2);
-
-    // Right side of arrow head
-    path.lineTo(
-      center.dx + arrowWidth / 2,
-      center.dy - arrowLength / 2 + headLength,
-    );
-
-    // Right side of arrow tail
-    path.lineTo(
-      center.dx + tailWidth / 2,
-      center.dy - arrowLength / 2 + headLength,
-    );
-
-    // Right bottom of tail
-    path.lineTo(center.dx + tailWidth / 2, center.dy + arrowLength / 2);
-
-    // Bottom center (tail end)
-    path.lineTo(center.dx - tailWidth / 2, center.dy + arrowLength / 2);
-
-    // Left bottom of tail
-    path.lineTo(
-      center.dx - tailWidth / 2,
-      center.dy - arrowLength / 2 + headLength,
-    );
-
-    // Left side of arrow head
-    path.lineTo(
-      center.dx - arrowWidth / 2,
-      center.dy - arrowLength / 2 + headLength,
-    );
-
-    // Close the path back to tip
-    path.close();
-
-    // Draw shadow for depth
-    final shadowPaint = Paint()
-      ..color = Colors.black.withOpacity(0.2)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
-
-    canvas.drawPath(path.shift(const Offset(2, 2)), shadowPaint);
-
-    // Draw main arrow
-    canvas.drawPath(path, paint);
-
-    // Draw outline
-    canvas.drawPath(path, strokePaint);
-
-    // Add inner detail line for more realistic look
-    final detailPaint = Paint()
-      ..color = Colors.white.withOpacity(0.5)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.5;
-
-    final detailPath = Path();
-    detailPath.moveTo(center.dx, center.dy - arrowLength / 2 + 8);
-    detailPath.lineTo(center.dx, center.dy + arrowLength / 2 - 8);
-    canvas.drawPath(detailPath, detailPaint);
-  }
-
-  @override
-  bool shouldRepaint(CustomPainter oldDelegate) => false;
 }

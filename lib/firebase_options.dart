@@ -46,7 +46,8 @@ class DefaultFirebaseOptions {
     messagingSenderId: '691409019645',
     projectId: 'friend-finder-hackathon',
     authDomain: 'friend-finder-hackathon.firebaseapp.com',
-    databaseURL: 'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
+    databaseURL:
+        'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
     storageBucket: 'friend-finder-hackathon.firebasestorage.app',
   );
 
@@ -55,7 +56,8 @@ class DefaultFirebaseOptions {
     appId: '1:691409019645:android:4dc63e755901e0043cd494',
     messagingSenderId: '691409019645',
     projectId: 'friend-finder-hackathon',
-    databaseURL: 'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
+    databaseURL:
+        'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
     storageBucket: 'friend-finder-hackathon.firebasestorage.app',
   );
 
@@ -64,7 +66,8 @@ class DefaultFirebaseOptions {
     appId: '1:691409019645:ios:64dc3f4e8e2746673cd494',
     messagingSenderId: '691409019645',
     projectId: 'friend-finder-hackathon',
-    databaseURL: 'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
+    databaseURL:
+        'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
     storageBucket: 'friend-finder-hackathon.firebasestorage.app',
     iosBundleId: 'com.example.flutterApplication1',
   );
@@ -74,7 +77,8 @@ class DefaultFirebaseOptions {
     appId: '1:691409019645:ios:64dc3f4e8e2746673cd494',
     messagingSenderId: '691409019645',
     projectId: 'friend-finder-hackathon',
-    databaseURL: 'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
+    databaseURL:
+        'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
     storageBucket: 'friend-finder-hackathon.firebasestorage.app',
     iosBundleId: 'com.example.flutterApplication1',
   );
@@ -85,7 +89,8 @@ class DefaultFirebaseOptions {
     messagingSenderId: '691409019645',
     projectId: 'friend-finder-hackathon',
     authDomain: 'friend-finder-hackathon.firebaseapp.com',
-    databaseURL: 'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
+    databaseURL:
+        'https://friend-finder-hackathon-default-rtdb.asia-southeast1.firebasedatabase.app',
     storageBucket: 'friend-finder-hackathon.firebasestorage.app',
   );
 }

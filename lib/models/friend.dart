@@ -3,11 +3,7 @@ class Friend {
   final String name;
   final int addedAt;
 
-  Friend({
-    required this.id,
-    required this.name,
-    required this.addedAt,
-  });
+  Friend({required this.id, required this.name, required this.addedAt});
 
   factory Friend.fromMap(String id, Map<dynamic, dynamic> map) {
     return Friend(
@@ -18,9 +14,6 @@ class Friend {
   }
 
   Map<String, dynamic> toMap() {
-    return {
-      'name': name,
-      'addedAt': addedAt,
-    };
+    return {'name': name, 'addedAt': addedAt};
   }
 }

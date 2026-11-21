@@ -1,7 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart' as ll;
 import 'dart:async';
 import 'dart:math';
 import '../services/bluetooth_distance_service.dart';
@@ -127,6 +125,7 @@ class _CommunityScreenState extends State<CommunityScreen>
       pos.latitude,
       pos.longitude,
       pos.heading,
+      pos.accuracy,
     );
     FirebaseService.updateCommunityLocation(
       deviceId: widget.deviceId,
@@ -134,6 +133,7 @@ class _CommunityScreenState extends State<CommunityScreen>
       lat: pos.latitude,
       lng: pos.longitude,
       heading: pos.heading,
+      accuracy: pos.accuracy,
     );
   }
 

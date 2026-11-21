@@ -12,12 +12,12 @@ class DeviceService {
   static Future<String> getDeviceId() async {
     final prefs = await SharedPreferences.getInstance();
     String? deviceId = prefs.getString(_deviceIdKey);
-    
+
     if (deviceId == null) {
       deviceId = const Uuid().v4();
       await prefs.setString(_deviceIdKey, deviceId);
     }
-    
+
     return deviceId;
   }
 
@@ -25,13 +25,13 @@ class DeviceService {
   static Future<String> getDeviceName() async {
     final prefs = await SharedPreferences.getInstance();
     String? name = prefs.getString(_deviceNameKey);
-    
+
     if (name == null) {
       // Generate default name from device info
       name = await _generateDefaultName();
       await prefs.setString(_deviceNameKey, name);
     }
-    
+
     return name;
   }
 
@@ -42,7 +42,7 @@ class DeviceService {
 
   static Future<String> _generateDefaultName() async {
     final deviceInfo = DeviceInfoPlugin();
-    
+
     try {
       if (kIsWeb) {
         final webInfo = await deviceInfo.webBrowserInfo;
@@ -58,7 +58,7 @@ class DeviceService {
       // Fallback
       return 'Device ${DateTime.now().millisecondsSinceEpoch % 1000}';
     }
-    
+
     return 'Unknown Device';
   }
 }

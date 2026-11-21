@@ -99,7 +99,9 @@ class FrontPageScreen extends StatelessWidget {
                               const SizedBox(width: 8),
                               Container(
                                 padding: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 2),
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
                                 decoration: BoxDecoration(
                                   color: Colors.white.withOpacity(0.25),
                                   borderRadius: BorderRadius.circular(12),
@@ -155,10 +157,7 @@ class FrontPageScreen extends StatelessWidget {
               const SizedBox(height: 6),
               Text(
                 'Choose how you want to discover and connect with people.',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Colors.grey.shade600,
-                ),
+                style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
               ),
 
               const SizedBox(height: 20),
@@ -178,9 +177,7 @@ class FrontPageScreen extends StatelessWidget {
                 onTap: () {
                   Navigator.push(
                     context,
-                    MaterialPageRoute(
-                      builder: (context) => const HomeScreen(),
-                    ),
+                    MaterialPageRoute(builder: (context) => const HomeScreen()),
                   );
                 },
               ),
@@ -226,8 +223,11 @@ class FrontPageScreen extends StatelessWidget {
                 ),
                 child: Row(
                   children: [
-                    Icon(Icons.shield_outlined,
-                        color: Colors.teal.shade600, size: 20),
+                    Icon(
+                      Icons.shield_outlined,
+                      color: Colors.teal.shade600,
+                      size: 20,
+                    ),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
@@ -332,7 +332,9 @@ class FrontPageScreen extends StatelessWidget {
                               const Spacer(),
                               Container(
                                 padding: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 4),
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
                                 decoration: BoxDecoration(
                                   color: badgeColor.withOpacity(0.12),
                                   borderRadius: BorderRadius.circular(8),

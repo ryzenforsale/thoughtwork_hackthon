@@ -21,10 +21,6 @@ class Device {
   }
 
   Map<String, dynamic> toMap() {
-    return {
-      'name': name,
-      'online': online,
-      'lastSeen': lastSeen,
-    };
+    return {'name': name, 'online': online, 'lastSeen': lastSeen};
   }
 }

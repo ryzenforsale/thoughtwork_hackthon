@@ -39,25 +39,23 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _listenForAutoConnect() {
-    _inviteListener = FirebaseService.listenForInstantInvite(deviceId!).listen(
-      (inviteData) async {
-        if (inviteData != null) {
-          // 1. Stop listening to prevent double-trigger
-          _inviteListener?.cancel(); 
+    _inviteListener = FirebaseService.listenForInstantInvite(deviceId!).listen((
+      inviteData,
+    ) async {
+      if (inviteData != null) {
+        // 1. Stop listening to prevent double-trigger
+        _inviteListener?.cancel();
 
-          // 2. Clear the invite from Firebase
-          await FirebaseService.clearInstantInvite(deviceId!);
+        // 2. Clear the invite from Firebase
+        await FirebaseService.clearInstantInvite(deviceId!);
 
-          if (!mounted) return;
+        if (!mounted) return;
 
-          // ✅ 3. Show FAKE popup for 2-3 seconds
-          _showFakeConnectionPopup(inviteData['fromId'], inviteData['sessionId']);
-        }
-      },
-    );
+        // ✅ 3. Show FAKE popup for 2-3 seconds
+        _showFakeConnectionPopup(inviteData['fromId'], inviteData['sessionId']);
+      }
+    });
   }
-
-
 
   // ✅ NEW: Show fake "Accept Request" popup on Person B
   void _showFakeConnectionPopup(String fromId, String sessionId) {
@@ -69,7 +67,7 @@ class _HomeScreenState extends State<HomeScreen> {
         Timer(const Duration(milliseconds: 2500), () {
           if (mounted) {
             Navigator.of(context).pop(); // Close popup
-            
+
             // Navigate to tracking screen
             Navigator.push(
               context,
@@ -128,7 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   },
                 ),
                 const SizedBox(height: 20),
-                
+
                 // Title
                 const Text(
                   'Connection Request',
@@ -139,7 +137,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                
+
                 // Message
                 Text(
                   'Someone wants to track you',
@@ -150,10 +148,13 @@ class _HomeScreenState extends State<HomeScreen> {
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 8),
-                
+
                 // Device ID (shortened)
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.white.withOpacity(0.2),
                     borderRadius: BorderRadius.circular(20),
@@ -168,7 +169,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 24),
-                
+
                 // Fake buttons (non-functional, just for show)
                 Row(
                   children: [
@@ -216,7 +217,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                
+
                 // Auto-connecting message
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -250,7 +251,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _startInstantTracking(String targetId, String targetName) async {
     // 1. Create Session & Force Invite
-    final sessionId = await FirebaseService.startDirectSession(deviceId!, targetId);
+    final sessionId = await FirebaseService.startDirectSession(
+      deviceId!,
+      targetId,
+    );
 
     if (!mounted) return;
 
@@ -312,15 +316,13 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-          
+
           // DEMO SEARCH BOX (Non-functional, decorative only)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             decoration: BoxDecoration(
               color: Colors.white,
-              border: Border(
-                bottom: BorderSide(color: Colors.grey.shade200),
-              ),
+              border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
             ),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -347,7 +349,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
-          
+
           // GLOBAL LIST
           Expanded(
             child: StreamBuilder<List<Map<String, dynamic>>>(
@@ -359,12 +361,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
                 final devices = snapshot.data!;
                 // Filter out myself
-                final otherDevices = devices.where((d) => d['id'] != deviceId).toList();
+                final otherDevices = devices
+                    .where((d) => d['id'] != deviceId)
+                    .toList();
 
                 if (otherDevices.isEmpty) {
-                  return const Center(
-                    child: Text("No other devices online."),
-                  );
+                  return const Center(child: Text("No other devices online."));
                 }
 
                 return ListView.builder(
